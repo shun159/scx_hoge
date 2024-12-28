@@ -9,7 +9,6 @@
 #include <bpf/bpf_tracing.h>
 
 #include "common.bpf.h"
-#include "ravg.bpf.h"
 
 char _license[] SEC("license") = "GPL";
 
@@ -63,7 +62,7 @@ const volatile u64 slice_lag = 20ULL * NSEC_PER_MSEC;
  * introduce interactivity issues or unfairness in scenarios with high kthread
  * activity, such as heavy I/O or network traffic.
  */
-const volatile bool local_kthreads;
+const volatile bool local_kthreads = true;
 
 /*
  * Scheduling statistics.
@@ -89,9 +88,8 @@ static u64 vtime_now;
  * Specify a sibling CPU relationship for a specific scheduling domain.
  */
 struct domain_arg {
-  s32 lvl_id;
-  s32 cpu_id;
-  s32 sibling_cpu_id;
+  __s32 cpu_id;
+  __s32 sibling_cpu_id;
 };
 
 /*
@@ -359,21 +357,6 @@ task_lock(struct task_struct *p)
   }
 }
 
-static __always_inline void
-task_refill_slice(struct task_struct *p)
-{
-  struct task_ctx *tctx;
-  __u64 slice;
-
-  tctx = try_lookup_task_ctx(p);
-  if (!tctx) {
-    return;
-  }
-
-  slice = scale_up_fair(p, tctx, slice);
-  p->scx.slice = CLAMP(slice, SLICE_MIN, slice_max);
-}
-
 static __always_inline __u64
 task_deadline(struct task_struct *p, struct task_ctx *tctx)
 {
@@ -392,6 +375,40 @@ task_deadline(struct task_struct *p, struct task_ctx *tctx)
   lat_weight = sched_prio_to_latency_weight(lat_prio);
 
   return tctx->avg_runtime * 1024 / lat_weight;
+}
+
+/*
+ * Return task's evaluated deadline applied to its vruntime.
+ */
+static __always_inline u64
+task_vtime(struct task_struct *p, struct task_ctx *tctx)
+{
+  u64 min_vruntime = vtime_now - task_lag(p, tctx);
+
+  /*
+   * Limit the vruntime to to avoid excessively penalizing tasks.
+   */
+  if (vtime_before(p->scx.dsq_vtime, min_vruntime)) {
+    p->scx.dsq_vtime = min_vruntime;
+    tctx->deadline = p->scx.dsq_vtime + task_deadline(p, tctx);
+  }
+
+  return tctx->deadline;
+}
+
+static __always_inline void
+task_refill_slice(struct task_struct *p)
+{
+  struct task_ctx *tctx;
+  __u64 slice;
+
+  tctx = try_lookup_task_ctx(p);
+  if (!tctx) {
+    return;
+  }
+
+  slice = scale_up_fair(p, tctx, slice);
+  p->scx.slice = CLAMP(slice, SLICE_MIN, slice_max);
 }
 
 static __always_inline void
@@ -432,7 +449,7 @@ task_set_domain(struct task_struct *p, __s32 cpu, const struct cpumask *cpumask)
 }
 
 static __always_inline __s32
-pick_idle_cpu(struct task_struct *p, __s32 prev_cpu, __u64 wake_flags, bool *is_idle)
+pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags, bool *is_idle)
 {
   const struct cpumask *idle_smtmask, *idle_cpumask;
   const struct cpumask *llc_mask;
@@ -443,13 +460,18 @@ pick_idle_cpu(struct task_struct *p, __s32 prev_cpu, __u64 wake_flags, bool *is_
   *is_idle = false;
 
   tctx = try_lookup_task_ctx(p);
-  if (!tctx) {
-    return -ENOMEM;
-  }
+  if (!tctx)
+    return -ENOENT;
 
+  /*
+   * Acquire the CPU masks to determine the idle CPUs in the system.
+   */
   idle_smtmask = scx_bpf_get_idle_smtmask();
   idle_cpumask = scx_bpf_get_idle_cpumask();
 
+  /*
+   * Task's scheduling domains.
+   */
   llc_mask = cast_mask(tctx->llc_mask);
   if (!llc_mask) {
     scx_bpf_error("LLC cpumask not initialized");
@@ -457,14 +479,26 @@ pick_idle_cpu(struct task_struct *p, __s32 prev_cpu, __u64 wake_flags, bool *is_
     goto out_put_cpumask;
   }
 
+  /*
+   * Check if the previously used CPU is still in the LLC task domain. If
+   * not, we may want to move the task back to its original LLC domain.
+   */
   is_prev_llc_affine = bpf_cpumask_test_cpu(prev_cpu, llc_mask);
 
+  /*
+   * If the current task is waking up another task and releasing the CPU
+   * (WAKE_SYNC), attempt to migrate the wakee on the same CPU as the
+   * waker.
+   */
   if (wake_flags & SCX_WAKE_SYNC) {
     struct task_struct *current = (void *)bpf_get_current_task_btf();
     const struct cpumask *curr_llc_domain;
     struct cpu_ctx *cctx;
     bool share_llc, has_idle;
 
+    /*
+     * Determine waker CPU scheduling domain.
+     */
     cpu = bpf_get_smp_processor_id();
     cctx = try_lookup_cpu_ctx(cpu);
     if (!cctx) {
@@ -473,17 +507,25 @@ pick_idle_cpu(struct task_struct *p, __s32 prev_cpu, __u64 wake_flags, bool *is_
     }
 
     curr_llc_domain = cast_mask(cctx->llc_mask);
-    if (!curr_llc_domain) {
+    if (!curr_llc_domain)
       curr_llc_domain = p->cpus_ptr;
-    }
 
-    share_llc = bpf_cpumask_test_cpu(cpu, curr_llc_domain);
+    /*
+     * If both the waker and wakee share the same LLC domain keep
+     * using the same CPU if possible.
+     */
+    share_llc = bpf_cpumask_test_cpu(prev_cpu, curr_llc_domain);
     if (share_llc && scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
       cpu = prev_cpu;
       *is_idle = true;
       goto out_put_cpumask;
     }
 
+    /*
+     * If the waker's LLC domain is not saturated attempt to migrate
+     * the wakee on the same CPU as the waker (since it's going to
+     * block and release the current CPU).
+     */
     has_idle = bpf_cpumask_intersects(curr_llc_domain, idle_cpumask);
     if (has_idle && bpf_cpumask_test_cpu(cpu, p->cpus_ptr) && !(current->flags & PF_EXITING) &&
         scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu) == 0) {
@@ -492,7 +534,14 @@ pick_idle_cpu(struct task_struct *p, __s32 prev_cpu, __u64 wake_flags, bool *is_
     }
   }
 
+  /*
+   * Find the best idle CPU, prioritizing full idle cores in SMT systems.
+   */
   if (smt_enabled) {
+    /*
+     * If the task can still run on the previously used CPU and
+     * it's a full-idle core, keep using it.
+     */
     if (is_prev_llc_affine && bpf_cpumask_test_cpu(prev_cpu, idle_smtmask) &&
         scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
       cpu = prev_cpu;
@@ -500,62 +549,64 @@ pick_idle_cpu(struct task_struct *p, __s32 prev_cpu, __u64 wake_flags, bool *is_
       goto out_put_cpumask;
     }
 
+    /*
+     * Search for any full-idle CPU in the primary domain that
+     * shares the same LLC domain.
+     */
     cpu = scx_bpf_pick_idle_cpu(llc_mask, SCX_PICK_IDLE_CORE);
+    if (cpu >= 0) {
+      *is_idle = true;
+      goto out_put_cpumask;
+    }
+
+    /*
+     * Search for any other full-idle core in the task's domain.
+     */
+    cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, SCX_PICK_IDLE_CORE);
     if (cpu >= 0) {
       *is_idle = true;
       goto out_put_cpumask;
     }
   }
 
+  /*
+   * If a full-idle core can't be found (or if this is not an SMT system)
+   * try to re-use the same CPU, even if it's not in a full-idle core.
+   */
   if (is_prev_llc_affine && scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
     cpu = prev_cpu;
     *is_idle = true;
     goto out_put_cpumask;
   }
 
+  /*
+   * Search for any idle CPU in the primary domain that shares the same
+   * LLC domain.
+   */
   cpu = scx_bpf_pick_idle_cpu(llc_mask, 0);
   if (cpu >= 0) {
     *is_idle = true;
     goto out_put_cpumask;
   }
 
-  // fallback CPU core
+  /*
+   * Search for any idle CPU in the task's scheduling domain.
+   */
+  cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+  if (cpu >= 0) {
+    *is_idle = true;
+    goto out_put_cpumask;
+  }
+
+  /*
+   * We couldn't find any idle CPU, return the previous CPU if it is in
+   * the task's LLC domain, otherwise pick any other CPU in the LLC
+   * domain.
+   */
   if (is_prev_llc_affine)
     cpu = prev_cpu;
   else
     cpu = scx_bpf_pick_any_cpu(llc_mask, 0);
-
-  if (cpu >= 0) {
-    __s64 current_load = scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu);
-    if (current_load > 3) {
-      __s64 checks = 0;
-      __s64 try_cpu = bpf_cpumask_first(llc_mask);
-      __s64 best_cpu = cpu;
-      __s64 best_load = current_load;
-
-      bpf_for(checks, 0, 2)
-      {
-        if (!(try_cpu >= scx_bpf_nr_cpu_ids())) {
-          break;
-        }
-
-        if (!bpf_cpumask_test_cpu(try_cpu, llc_mask)) {
-          continue;
-        }
-
-        __s64 try_load = scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | try_cpu);
-        if (try_load < best_load) {
-          best_load = try_load;
-          best_cpu = try_cpu;
-        }
-
-        try_cpu++;
-      }
-      if (best_cpu != cpu) {
-        cpu = best_cpu;
-      }
-    }
-  }
 
 out_put_cpumask:
   scx_bpf_put_cpumask(idle_cpumask);
@@ -755,14 +806,18 @@ enable_sibling_cpu(struct domain_arg *input)
   int err = 0;
 
   cctx = try_lookup_cpu_ctx(input->cpu_id);
-  if (!cctx)
+  if (!cctx) {
+    bpf_printk("failed to lookup cpumask: %d\n", err);
     return -ENOENT;
+  }
 
   /* Make sure the target CPU mask is initialized */
   pmask = &cctx->llc_mask;
   err = init_cpumask(pmask);
-  if (err)
+  if (err) {
+    bpf_printk("failed to init cpumask: %d\n", err);
     return err;
+  }
 
   bpf_rcu_read_lock();
   mask = *pmask;
@@ -776,13 +831,12 @@ enable_sibling_cpu(struct domain_arg *input)
 __s32
 BPF_STRUCT_OPS(hoge_select_cpu, struct task_struct *p, __s32 prev_cpu, __u64 wake_flags)
 {
-  bpf_printk("select_cpu");
   bool is_idle = false;
   __s32 cpu;
 
   cpu = pick_idle_cpu(p, prev_cpu, wake_flags, &is_idle);
   if (is_idle) {
-    scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_INF, 0);
+    scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
     __sync_fetch_and_add(&nr_direct_dispatches, 1);
   }
 
@@ -792,7 +846,6 @@ BPF_STRUCT_OPS(hoge_select_cpu, struct task_struct *p, __s32 prev_cpu, __u64 wak
 void
 BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
 {
-  bpf_printk("enqueue");
   struct task_ctx *tctx;
 
   tctx = try_lookup_task_ctx(p);
@@ -803,7 +856,11 @@ BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
   if (is_kthread(p) && (local_kthreads || p->nr_cpus_allowed == 1)) {
     scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags | SCX_ENQ_PREEMPT);
     __sync_fetch_and_add(&nr_kthread_dispatches, 1);
+    return;
   }
+
+  scx_bpf_dispatch_vtime(p, SHARED_DSQ, SCX_SLICE_DFL, task_vtime(p, tctx), enq_flags);
+  __sync_fetch_and_add(&nr_shared_dispatches, 1);
 
   kick_task_cpu(p);
 }
@@ -811,7 +868,6 @@ BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
 void
 BPF_STRUCT_OPS(hoge_dispatch, __s32 cpu, struct task_struct *prev)
 {
-  bpf_printk("dispatch");
   /*
    * If the task can still run and it's holding a user-space lock, let it
    * run for another round.
@@ -842,7 +898,6 @@ BPF_STRUCT_OPS(hoge_dispatch, __s32 cpu, struct task_struct *prev)
 void
 BPF_STRUCT_OPS(hoge_stopping, struct task_struct *p, bool runnable)
 {
-  bpf_printk("stopping");
   __u64 now = bpf_ktime_get_ns(), slice;
   __s64 delta_t;
   struct task_ctx *tctx;
@@ -877,7 +932,6 @@ BPF_STRUCT_OPS(hoge_stopping, struct task_struct *p, bool runnable)
 void
 BPF_STRUCT_OPS(hoge_running, struct task_struct *p)
 {
-  bpf_printk("running");
   struct task_ctx *tctx;
 
   task_refill_slice(p);
@@ -896,7 +950,6 @@ BPF_STRUCT_OPS(hoge_running, struct task_struct *p)
 void
 BPF_STRUCT_OPS(hoge_runnable, struct task_struct *p, __u64 enq_flags)
 {
-  bpf_printk("runnable");
   struct task_ctx *tctx;
 
   tctx = try_lookup_task_ctx(p);
@@ -910,7 +963,6 @@ BPF_STRUCT_OPS(hoge_runnable, struct task_struct *p, __u64 enq_flags)
 void
 BPF_STRUCT_OPS(hoge_enable, struct task_struct *p)
 {
-  bpf_printk("enable");
   __u64 now = bpf_ktime_get_ns();
   struct task_ctx *tctx;
 
@@ -956,6 +1008,8 @@ BPF_STRUCT_OPS(hoge_init_task, struct task_struct *p, struct scx_init_task_args 
   if (cpumask) {
     bpf_cpumask_release(cpumask);
   }
+
+  task_set_domain(p, cpu, p->cpus_ptr);
 
   return 0;
 }
