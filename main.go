@@ -21,8 +21,10 @@ import (
 
 // Specify a sibling CPU relationship for a specific scheduling domain.
 type DomainArg struct {
+	CacheLevel   int32
 	CpuID        int32
 	SiblingCpuID int32
+	_            int32
 }
 
 func main() {
@@ -36,68 +38,6 @@ func main() {
 		log.Fatalf("loading objects: %v", errors.WithStack(err))
 	}
 	defer objs.Close()
-
-	fwLink, err := link.AttachTracing(link.TracingOptions{
-		Program: objs.FexitFutexWait,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer fwLink.Close()
-
-	flpLink, err := link.AttachTracing(link.TracingOptions{
-		Program: objs.FexitFutexLockPi,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer flpLink.Close()
-
-	fupLink, err := link.AttachTracing(link.TracingOptions{
-		Program: objs.FexitFutexUnlockPi,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer fupLink.Close()
-
-	fwmLink, err := link.AttachTracing(link.TracingOptions{
-		Program: objs.FexitFutexWaitMultiple,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer fwmLink.Close()
-
-	fwrLink, err := link.AttachTracing(link.TracingOptions{
-		Program: objs.FexitFutexWaitRequeuePi,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer fwrLink.Close()
-
-	fwkLink, err := link.AttachTracing(link.TracingOptions{
-		Program: objs.FexitFutexWake,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer fwkLink.Close()
-
-	fwoLink, err := link.AttachTracing(link.TracingOptions{
-		Program: objs.FexitFutexWakeOp,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer fwoLink.Close()
-
-	kp, err := link.Kprobe("vfs_fsync_range", objs.FexitVfsFsyncRange, nil)
-	if err != nil {
-		log.Fatalf("opening kprobe: %s", err)
-	}
-	defer kp.Close()
 
 	topology, err := scx_utils.NewTopology()
 	if err != nil {
@@ -113,12 +53,23 @@ func main() {
 			fmt.Printf(" %d\n", sib)
 
 			buf := new(bytes.Buffer)
-			arg := DomainArg{CpuID: int32(cpu.ID), SiblingCpuID: int32(sib)}
+			arg := DomainArg{CacheLevel: int32(cpu.L2ID), CpuID: int32(cpu.ID), SiblingCpuID: int32(sib)}
 			if err := binary.Write(buf, binary.LittleEndian, arg); err != nil {
 				log.Fatalf("Failed to encode DomainArg: %v", err)
 			}
 
 			_, err := objs.EnableSiblingCpu.Run(&ebpf.RunOptions{Context: buf.Bytes()})
+			if err != nil {
+				log.Printf("Error: %v", err)
+			}
+
+			buf = new(bytes.Buffer)
+			arg = DomainArg{CacheLevel: int32(cpu.L3ID), CpuID: int32(cpu.ID), SiblingCpuID: int32(sib)}
+			if err := binary.Write(buf, binary.LittleEndian, arg); err != nil {
+				log.Fatalf("Failed to encode DomainArg: %v", err)
+			}
+
+			_, err = objs.EnableSiblingCpu.Run(&ebpf.RunOptions{Context: buf.Bytes()})
 			if err != nil {
 				log.Printf("Error: %v", err)
 			}

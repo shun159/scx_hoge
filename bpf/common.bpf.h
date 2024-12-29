@@ -436,10 +436,10 @@ log2___u64(__u64 v)
 /*
  * Access a cpumask in read-only mode (typically to check bits).
  */
-const struct cpumask *
-cast_mask(struct bpf_cpumask *mask)
+struct cpumask *
+cast_mask(const struct bpf_cpumask *mask)
 {
-  return (const struct cpumask *)mask;
+  return (struct cpumask *)mask;
 }
 
 #endif /* __SCX_COMMON_BPF_H */
