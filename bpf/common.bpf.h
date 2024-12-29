@@ -34,10 +34,7 @@ __s32 scx_bpf_select_cpu_dfl(struct task_struct *p,
                              __s32 prev_cpu,
                              __u64 wake_flags,
                              bool *is_idle) __ksym;
-void scx_bpf_dispatch(struct task_struct *p,
-                      __u64 dsq_id,
-                      __u64 slice,
-                      __u64 enq_flags) __ksym;
+void scx_bpf_dispatch(struct task_struct *p, __u64 dsq_id, __u64 slice, __u64 enq_flags) __ksym;
 void scx_bpf_dispatch_vtime(struct task_struct *p,
                             __u64 dsq_id,
                             __u64 slice,
@@ -50,21 +47,13 @@ __u32 scx_bpf_reenqueue_local(void) __ksym;
 void scx_bpf_kick_cpu(__s32 cpu, __u64 flags) __ksym;
 __s32 scx_bpf_dsq_nr_queued(__u64 dsq_id) __ksym;
 void scx_bpf_destroy_dsq(__u64 dsq_id) __ksym;
-int bpf_iter_scx_dsq_new(struct bpf_iter_scx_dsq *it,
-                         __u64 dsq_id,
-                         __u64 flags) __ksym __weak;
-struct task_struct *
-bpf_iter_scx_dsq_next(struct bpf_iter_scx_dsq *it) __ksym __weak;
+int bpf_iter_scx_dsq_new(struct bpf_iter_scx_dsq *it, __u64 dsq_id, __u64 flags) __ksym __weak;
+struct task_struct *bpf_iter_scx_dsq_next(struct bpf_iter_scx_dsq *it) __ksym __weak;
 void bpf_iter_scx_dsq_destroy(struct bpf_iter_scx_dsq *it) __ksym __weak;
-void scx_bpf_exit_bstr(s64 exit_code,
-                       char *fmt,
-                       unsigned long long *data,
-                       __u32 data__sz) __ksym __weak;
 void
-scx_bpf_error_bstr(char *fmt, unsigned long long *data, __u32 data_len) __ksym;
-void scx_bpf_dump_bstr(char *fmt,
-                       unsigned long long *data,
-                       __u32 data_len) __ksym __weak;
+scx_bpf_exit_bstr(s64 exit_code, char *fmt, unsigned long long *data, __u32 data__sz) __ksym __weak;
+void scx_bpf_error_bstr(char *fmt, unsigned long long *data, __u32 data_len) __ksym;
+void scx_bpf_dump_bstr(char *fmt, unsigned long long *data, __u32 data_len) __ksym __weak;
 __u32 scx_bpf_cpuperf_cap(__s32 cpu) __ksym __weak;
 __u32 scx_bpf_cpuperf_cur(__s32 cpu) __ksym __weak;
 void scx_bpf_cpuperf_set(__s32 cpu, __u32 perf) __ksym __weak;
@@ -92,17 +81,16 @@ ___scx_bpf_bstr_format_checker(const char *fmt, ...)
  * bstr exit kfuncs. Callers to this function should use ___fmt and ___param to
  * refer to the initialized list of inputs to the bstr kfunc.
  */
-#define scx_bpf_bstr_preamble(fmt, args...)                                    \
-  static char ___fmt[] = fmt;                                                  \
-  /*                                                                           \
-   * Note that __param[] must have at least one                                \
-   * element to keep the verifier happy.                                       \
-   */                                                                          \
-  unsigned long long ___param[___bpf_narg(args) ?: 1] = {};                    \
-                                                                               \
-  _Pragma("GCC diagnostic push")                                               \
-      _Pragma("GCC diagnostic ignored \"-Wint-conversion\"")                   \
-          ___bpf_fill(___param, args);                                         \
+#define scx_bpf_bstr_preamble(fmt, args...)                                                        \
+  static char ___fmt[] = fmt;                                                                      \
+  /*                                                                                               \
+   * Note that __param[] must have at least one                                                    \
+   * element to keep the verifier happy.                                                           \
+   */                                                                                              \
+  unsigned long long ___param[___bpf_narg(args) ?: 1] = {};                                        \
+                                                                                                   \
+  _Pragma("GCC diagnostic push") _Pragma("GCC diagnostic ignored \"-Wint-conversion\"")            \
+      ___bpf_fill(___param, args);                                                                 \
   _Pragma("GCC diagnostic pop")
 
 /*
@@ -110,11 +98,10 @@ ___scx_bpf_bstr_format_checker(const char *fmt, ...)
  * instead of an array of __u64. Using this macro will cause the scheduler to
  * exit cleanly with the specified exit code being passed to user space.
  */
-#define scx_bpf_exit(code, fmt, args...)                                       \
-  ({                                                                           \
-    scx_bpf_bstr_preamble(fmt, args)                                           \
-        scx_bpf_exit_bstr(code, ___fmt, ___param, sizeof(___param));           \
-    ___scx_bpf_bstr_format_checker(fmt, ##args);                               \
+#define scx_bpf_exit(code, fmt, args...)                                                           \
+  ({                                                                                               \
+    scx_bpf_bstr_preamble(fmt, args) scx_bpf_exit_bstr(code, ___fmt, ___param, sizeof(___param));  \
+    ___scx_bpf_bstr_format_checker(fmt, ##args);                                                   \
   })
 
 /*
@@ -123,30 +110,28 @@ ___scx_bpf_bstr_format_checker(const char *fmt, ...)
  * exit in an erroneous state, with diagnostic information being passed to the
  * user.
  */
-#define scx_bpf_error(fmt, args...)                                            \
-  ({                                                                           \
-    scx_bpf_bstr_preamble(fmt, args)                                           \
-        scx_bpf_error_bstr(___fmt, ___param, sizeof(___param));                \
-    ___scx_bpf_bstr_format_checker(fmt, ##args);                               \
+#define scx_bpf_error(fmt, args...)                                                                \
+  ({                                                                                               \
+    scx_bpf_bstr_preamble(fmt, args) scx_bpf_error_bstr(___fmt, ___param, sizeof(___param));       \
+    ___scx_bpf_bstr_format_checker(fmt, ##args);                                                   \
   })
 
 /*
  * scx_bpf_dump() wraps the scx_bpf_dump_bstr() kfunc with variadic arguments
  * instead of an array of __u64. To be used from ops.dump() and friends.
  */
-#define scx_bpf_dump(fmt, args...)                                             \
-  ({                                                                           \
-    scx_bpf_bstr_preamble(fmt, args)                                           \
-        scx_bpf_dump_bstr(___fmt, ___param, sizeof(___param));                 \
-    ___scx_bpf_bstr_format_checker(fmt, ##args);                               \
+#define scx_bpf_dump(fmt, args...)                                                                 \
+  ({                                                                                               \
+    scx_bpf_bstr_preamble(fmt, args) scx_bpf_dump_bstr(___fmt, ___param, sizeof(___param));        \
+    ___scx_bpf_bstr_format_checker(fmt, ##args);                                                   \
   })
 
-#define BPF_STRUCT_OPS(name, args...)                                          \
-  SEC("struct_ops/" #name)                                                     \
+#define BPF_STRUCT_OPS(name, args...)                                                              \
+  SEC("struct_ops/" #name)                                                                         \
   BPF_PROG(name, ##args)
 
-#define BPF_STRUCT_OPS_SLEEPABLE(name, args...)                                \
-  SEC("struct_ops.s/" #name)                                                   \
+#define BPF_STRUCT_OPS_SLEEPABLE(name, args...)                                                    \
+  SEC("struct_ops.s/" #name)                                                                       \
   BPF_PROG(name, ##args)
 
 /**
@@ -195,20 +180,19 @@ ___scx_bpf_bstr_format_checker(const char *fmt, ...)
  * be a pointer to the area. Use `MEMBER_VPTR(*ptr, .member)` instead of
  * `MEMBER_VPTR(ptr, ->member)`.
  */
-#define MEMBER_VPTR(base, member)                                              \
-  (typeof((base)member) *)({                                                   \
-    __u64 __base = (__u64) & (base);                                           \
-    __u64 __addr = (__u64) & ((base)member) - __base;                          \
-    _Static_assert(sizeof(base) >= sizeof((base)member),                       \
-                   "@base is smaller than @member, is @base a pointer?");      \
-    asm volatile(                                                              \
-        "if %0 <= %[max] goto +2\n"                                            \
-        "%0 = 0\n"                                                             \
-        "goto +1\n"                                                            \
-        "%0 += %1\n"                                                           \
-        : "+r"(__addr)                                                         \
-        : "r"(__base), [max] "i"(sizeof(base) - sizeof((base)member)));        \
-    __addr;                                                                    \
+#define MEMBER_VPTR(base, member)                                                                  \
+  (typeof((base)member) *)({                                                                       \
+    __u64 __base = (__u64) & (base);                                                               \
+    __u64 __addr = (__u64) & ((base)member) - __base;                                              \
+    _Static_assert(sizeof(base) >= sizeof((base)member),                                           \
+                   "@base is smaller than @member, is @base a pointer?");                          \
+    asm volatile("if %0 <= %[max] goto +2\n"                                                       \
+                 "%0 = 0\n"                                                                        \
+                 "goto +1\n"                                                                       \
+                 "%0 += %1\n"                                                                      \
+                 : "+r"(__addr)                                                                    \
+                 : "r"(__base), [max] "i"(sizeof(base) - sizeof((base)member)));                   \
+    __addr;                                                                                        \
   })
 
 /**
@@ -225,17 +209,17 @@ ___scx_bpf_bstr_format_checker(const char *fmt, ...)
  * size of the array to compute the max, which will result in rejection by
  * the verifier.
  */
-#define ARRAY_ELEM_PTR(arr, i, n)                                              \
-  (typeof(arr[i]) *)({                                                         \
-    __u64 __base = (__u64)arr;                                                 \
-    __u64 __addr = (__u64) & (arr[i]) - __base;                                \
-    asm volatile("if %0 <= %[max] goto +2\n"                                   \
-                 "%0 = 0\n"                                                    \
-                 "goto +1\n"                                                   \
-                 "%0 += %1\n"                                                  \
-                 : "+r"(__addr)                                                \
-                 : "r"(__base), [max] "r"(sizeof(arr[0]) * ((n) - 1)));        \
-    __addr;                                                                    \
+#define ARRAY_ELEM_PTR(arr, i, n)                                                                  \
+  (typeof(arr[i]) *)({                                                                             \
+    __u64 __base = (__u64)arr;                                                                     \
+    __u64 __addr = (__u64) & (arr[i]) - __base;                                                    \
+    asm volatile("if %0 <= %[max] goto +2\n"                                                       \
+                 "%0 = 0\n"                                                                        \
+                 "goto +1\n"                                                                       \
+                 "%0 += %1\n"                                                                      \
+                 : "+r"(__addr)                                                                    \
+                 : "r"(__base), [max] "r"(sizeof(arr[0]) * ((n) - 1)));                            \
+    __addr;                                                                                        \
   })
 
 /*
@@ -243,33 +227,26 @@ ___scx_bpf_bstr_format_checker(const char *fmt, ...)
  */
 
 /* list and rbtree */
-#define __contains(name, node)                                                 \
-  __attribute__((btf_decl_tag("contains:" #name ":" #node)))
+#define __contains(name, node) __attribute__((btf_decl_tag("contains:" #name ":" #node)))
 #define private(name) SEC(".data." #name) __hidden __attribute__((aligned(8)))
 
 void *bpf_obj_new_impl(__u64 local_type_id, void *meta) __ksym;
 void bpf_obj_drop_impl(void *kptr, void *meta) __ksym;
 
-#define bpf_obj_new(type)                                                      \
-  ((type *)bpf_obj_new_impl(bpf_core_type_id_local(type), NULL))
+#define bpf_obj_new(type) ((type *)bpf_obj_new_impl(bpf_core_type_id_local(type), NULL))
 #define bpf_obj_drop(kptr) bpf_obj_drop_impl(kptr, NULL)
 
-void bpf_list_push_front(struct bpf_list_head *head,
-                         struct bpf_list_node *node) __ksym;
-void bpf_list_push_back(struct bpf_list_head *head,
-                        struct bpf_list_node *node) __ksym;
+void bpf_list_push_front(struct bpf_list_head *head, struct bpf_list_node *node) __ksym;
+void bpf_list_push_back(struct bpf_list_head *head, struct bpf_list_node *node) __ksym;
 struct bpf_list_node *bpf_list_pop_front(struct bpf_list_head *head) __ksym;
 struct bpf_list_node *bpf_list_pop_back(struct bpf_list_head *head) __ksym;
-struct bpf_rb_node *bpf_rbtree_remove(struct bpf_rb_root *root,
-                                      struct bpf_rb_node *node) __ksym;
+struct bpf_rb_node *bpf_rbtree_remove(struct bpf_rb_root *root, struct bpf_rb_node *node) __ksym;
 int bpf_rbtree_add_impl(struct bpf_rb_root *root,
                         struct bpf_rb_node *node,
-                        bool(less)(struct bpf_rb_node *a,
-                                   const struct bpf_rb_node *b),
+                        bool(less)(struct bpf_rb_node *a, const struct bpf_rb_node *b),
                         void *meta,
                         __u64 off) __ksym;
-#define bpf_rbtree_add(head, node, less)                                       \
-  bpf_rbtree_add_impl(head, node, less, NULL, 0)
+#define bpf_rbtree_add(head, node, less) bpf_rbtree_add_impl(head, node, less, NULL, 0)
 
 struct bpf_rb_node *bpf_rbtree_first(struct bpf_rb_root *root) __ksym;
 
@@ -292,8 +269,7 @@ struct cgroup_subsys_state;
 extern int bpf_iter_css_new(struct bpf_iter_css *it,
                             struct cgroup_subsys_state *start,
                             unsigned int flags) __weak __ksym;
-extern struct cgroup_subsys_state *
-bpf_iter_css_next(struct bpf_iter_css *it) __weak __ksym;
+extern struct cgroup_subsys_state *bpf_iter_css_next(struct bpf_iter_css *it) __weak __ksym;
 extern void bpf_iter_css_destroy(struct bpf_iter_css *it) __weak __ksym;
 
 /* cpumask */
@@ -305,10 +281,8 @@ __u32 bpf_cpumask_first_zero(const struct cpumask *cpumask) __ksym;
 void bpf_cpumask_set_cpu(__u32 cpu, struct bpf_cpumask *cpumask) __ksym;
 void bpf_cpumask_clear_cpu(__u32 cpu, struct bpf_cpumask *cpumask) __ksym;
 bool bpf_cpumask_test_cpu(__u32 cpu, const struct cpumask *cpumask) __ksym;
-bool bpf_cpumask_test_and_set_cpu(__u32 cpu,
-                                  struct bpf_cpumask *cpumask) __ksym;
-bool bpf_cpumask_test_and_clear_cpu(__u32 cpu,
-                                    struct bpf_cpumask *cpumask) __ksym;
+bool bpf_cpumask_test_and_set_cpu(__u32 cpu, struct bpf_cpumask *cpumask) __ksym;
+bool bpf_cpumask_test_and_clear_cpu(__u32 cpu, struct bpf_cpumask *cpumask) __ksym;
 void bpf_cpumask_setall(struct bpf_cpumask *cpumask) __ksym;
 void bpf_cpumask_clear(struct bpf_cpumask *cpumask) __ksym;
 bool bpf_cpumask_and(struct bpf_cpumask *dst,
@@ -320,19 +294,15 @@ void bpf_cpumask_or(struct bpf_cpumask *dst,
 void bpf_cpumask_xor(struct bpf_cpumask *dst,
                      const struct cpumask *src1,
                      const struct cpumask *src2) __ksym;
-bool bpf_cpumask_equal(const struct cpumask *src1,
-                       const struct cpumask *src2) __ksym;
-bool bpf_cpumask_intersects(const struct cpumask *src1,
-                            const struct cpumask *src2) __ksym;
-bool bpf_cpumask_subset(const struct cpumask *src1,
-                        const struct cpumask *src2) __ksym;
+bool bpf_cpumask_equal(const struct cpumask *src1, const struct cpumask *src2) __ksym;
+bool bpf_cpumask_intersects(const struct cpumask *src1, const struct cpumask *src2) __ksym;
+bool bpf_cpumask_subset(const struct cpumask *src1, const struct cpumask *src2) __ksym;
 bool bpf_cpumask_empty(const struct cpumask *cpumask) __ksym;
 bool bpf_cpumask_full(const struct cpumask *cpumask) __ksym;
-void bpf_cpumask_copy(struct bpf_cpumask *dst,
-                      const struct cpumask *src) __ksym;
+void bpf_cpumask_copy(struct bpf_cpumask *dst, const struct cpumask *src) __ksym;
 __u32 bpf_cpumask_any_distribute(const struct cpumask *cpumask) __ksym;
-__u32 bpf_cpumask_any_and_distribute(const struct cpumask *src1,
-                                     const struct cpumask *src2) __ksym;
+__u32 bpf_cpumask_any_and_distribute(const struct cpumask *src1, const struct cpumask *src2) __ksym;
+__u32 bpf_cpumask_weight(const struct cpumask *cpumask) __ksym;
 
 /* rcu */
 void bpf_rcu_read_lock(void) __ksym;
@@ -402,24 +372,24 @@ __write_once_size(volatile void *p, void *res, int size)
   }
 }
 
-#define READ_ONCE(x)                                                           \
-  ({                                                                           \
-    union {                                                                    \
-      typeof(x) __val;                                                         \
-      char __c[1];                                                             \
-    } __u = {.__c = {0}};                                                      \
-    __read_once_size(&(x), __u.__c, sizeof(x));                                \
-    __u.__val;                                                                 \
+#define READ_ONCE(x)                                                                               \
+  ({                                                                                               \
+    union {                                                                                        \
+      typeof(x) __val;                                                                             \
+      char __c[1];                                                                                 \
+    } __u = {.__c = {0}};                                                                          \
+    __read_once_size(&(x), __u.__c, sizeof(x));                                                    \
+    __u.__val;                                                                                     \
   })
 
-#define WRITE_ONCE(x, val)                                                     \
-  ({                                                                           \
-    union {                                                                    \
-      typeof(x) __val;                                                         \
-      char __c[1];                                                             \
-    } __u = {.__val = (val)};                                                  \
-    __write_once_size(&(x), __u.__c, sizeof(x));                               \
-    __u.__val;                                                                 \
+#define WRITE_ONCE(x, val)                                                                         \
+  ({                                                                                               \
+    union {                                                                                        \
+      typeof(x) __val;                                                                             \
+      char __c[1];                                                                                 \
+    } __u = {.__val = (val)};                                                                      \
+    __write_once_size(&(x), __u.__c, sizeof(x));                                                   \
+    __u.__val;                                                                                     \
   })
 
 /*

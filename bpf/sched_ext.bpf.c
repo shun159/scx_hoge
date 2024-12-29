@@ -65,6 +65,11 @@ const volatile u64 slice_lag = 20ULL * NSEC_PER_MSEC;
 const volatile bool local_kthreads = true;
 
 /*
+ * Amount of online CPUs.
+ */
+volatile u64 nr_online_cpus;
+
+/*
  * Scheduling statistics.
  */
 volatile u64 nr_kthread_dispatches, nr_direct_dispatches, nr_shared_dispatches;
@@ -73,6 +78,12 @@ volatile u64 nr_kthread_dispatches, nr_direct_dispatches, nr_shared_dispatches;
  * CPUs in the system have SMT is enabled.
  */
 const volatile bool smt_enabled = true;
+
+/*
+ * Mask of CPUs that the scheduler can use until the system becomes saturated,
+ * at which point tasks may overflow to other available CPUs.
+ */
+struct bpf_cpumask __kptr *primary_cpumask;
 
 /*
  * Current global vruntime.
@@ -653,7 +664,7 @@ kick_task_cpu(struct task_struct *p)
   }
 }
 
-static int
+static __always_inline int
 init_cpumask(struct bpf_cpumask **cpumask)
 {
   struct bpf_cpumask *mask;
@@ -675,6 +686,22 @@ init_cpumask(struct bpf_cpumask **cpumask)
     err = -ENOMEM;
 
   return err;
+}
+
+/*
+ * Evaluate the amount of online CPUs.
+ */
+s32
+get_nr_online_cpus(void)
+{
+  const struct cpumask *online_cpumask;
+  int cpus;
+
+  online_cpumask = scx_bpf_get_online_cpumask();
+  cpus = bpf_cpumask_weight(online_cpumask);
+  scx_bpf_put_cpumask(online_cpumask);
+
+  return cpus;
 }
 
 SEC("fexit/__futex_wait")
@@ -1019,6 +1046,9 @@ BPF_STRUCT_OPS_SLEEPABLE(hoge_init)
 {
   __s32 err;
 
+  // initialize amount of online CPUs
+  nr_online_cpus = get_nr_online_cpus();
+
   /*
    * Create the shared DSQ.
    *
@@ -1027,6 +1057,11 @@ BPF_STRUCT_OPS_SLEEPABLE(hoge_init)
   err = scx_bpf_create_dsq(SHARED_DSQ, -1);
   if (err) {
     scx_bpf_error("failed to create shared DSQ: %d", err);
+    return err;
+  }
+
+  err = init_cpumask(&primary_cpumask);
+  if (err) {
     return err;
   }
 
