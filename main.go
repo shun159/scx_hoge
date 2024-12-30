@@ -27,6 +27,21 @@ type DomainArg struct {
 	_            int32
 }
 
+func enableSiblingCpu(objs *bpfObjects, cacheLvl, cpuID, sibID int) error {
+	buf := new(bytes.Buffer)
+	arg := DomainArg{CacheLevel: int32(cacheLvl), CpuID: int32(cpuID), SiblingCpuID: int32(sibID)}
+	if err := binary.Write(buf, binary.LittleEndian, arg); err != nil {
+		return fmt.Errorf("Failed to encode DomainArg: %v", err)
+	}
+
+	_, err := objs.EnableSiblingCpu.Run(&ebpf.RunOptions{Context: buf.Bytes()})
+	if err != nil {
+		return fmt.Errorf("test_run enable_sibling_cpu: %v", err)
+	}
+
+	return nil
+}
+
 func main() {
 	// Allow the current process to lock memory for eBPF resources.
 	if err := rlimit.RemoveMemlock(); err != nil {
@@ -45,37 +60,24 @@ func main() {
 	}
 
 	for _, cpu := range topology.AllCPUs {
-		fmt.Printf("enable sibling cpu: %d (SMT primary: %v)--->", cpu.ID, cpu.IsPrimary)
-		for _, sib := range cpu.SiblingIDs {
-			if cpu.ID == sib {
+		for _, sib := range topology.AllCPUs {
+			if cpu.L2ID != sib.L2ID {
 				continue
 			}
-			fmt.Printf(" %d\n", sib)
-
-			buf := new(bytes.Buffer)
-			arg := DomainArg{CacheLevel: int32(cpu.L2ID), CpuID: int32(cpu.ID), SiblingCpuID: int32(sib)}
-			if err := binary.Write(buf, binary.LittleEndian, arg); err != nil {
-				log.Fatalf("Failed to encode DomainArg: %v", err)
+			if err := enableSiblingCpu(&objs, cpu.L2ID, cpu.ID, sib.ID); err != nil {
+				log.Fatalf("enable_sibling_cpu L2: %s", err)
 			}
-
-			_, err := objs.EnableSiblingCpu.Run(&ebpf.RunOptions{Context: buf.Bytes()})
-			if err != nil {
-				log.Printf("Error: %v", err)
-			}
-
-			buf = new(bytes.Buffer)
-			arg = DomainArg{CacheLevel: int32(cpu.L3ID), CpuID: int32(cpu.ID), SiblingCpuID: int32(sib)}
-			if err := binary.Write(buf, binary.LittleEndian, arg); err != nil {
-				log.Fatalf("Failed to encode DomainArg: %v", err)
-			}
-
-			_, err = objs.EnableSiblingCpu.Run(&ebpf.RunOptions{Context: buf.Bytes()})
-			if err != nil {
-				log.Printf("Error: %v", err)
-			}
-
 		}
-		fmt.Println()
+
+		for _, sib := range topology.AllCPUs {
+			if cpu.LLCID != sib.LLCID {
+				continue
+			}
+			if err := enableSiblingCpu(&objs, cpu.L3ID, cpu.ID, sib.ID); err != nil {
+				log.Fatalf("enable_sibling_cpu L3: %s", err)
+			}
+		}
+
 	}
 
 	m := objs.ScxHoge
