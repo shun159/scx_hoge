@@ -673,7 +673,7 @@ pick_idle_cpu(struct task_struct *p, __s32 prev_cpu, __u64 wake_flags, bool *is_
   /*
    * Step 2: Prioritize idle CPUs in L2 cache domain.
    */
-  cpu = scx_bpf_pick_idle_cpu(l2_mask, SCX_PICK_IDLE_CORE);
+  cpu = scx_bpf_pick_idle_cpu(l2_mask, 0);
   if (cpu >= 0) {
     *is_idle = true;
     goto out_put_cpumask;
@@ -682,21 +682,10 @@ pick_idle_cpu(struct task_struct *p, __s32 prev_cpu, __u64 wake_flags, bool *is_
   /*
    * Step 3: Prioritize idle CPUs in L3 cache domain.
    */
-  cpu = scx_bpf_pick_idle_cpu(l3_mask, SCX_PICK_IDLE_CORE);
+  cpu = scx_bpf_pick_idle_cpu(l3_mask, 0);
   if (cpu >= 0) {
     *is_idle = true;
     goto out_put_cpumask;
-  }
-
-  /*
-   * Step 4: SMT - Pick any SMT idle thread.
-   */
-  if (smt_enabled) {
-    cpu = scx_bpf_pick_idle_cpu(p_mask, SCX_PICK_IDLE_CORE);
-    if (cpu >= 0) {
-      *is_idle = true;
-      goto out_put_cpumask;
-    }
   }
 
   bpf_for(i, 0, get_nr_online_cpus())
@@ -715,35 +704,6 @@ pick_idle_cpu(struct task_struct *p, __s32 prev_cpu, __u64 wake_flags, bool *is_
     cpu = least_loaded_cpu;
     goto out_put_cpumask;
   }
-
-  /*
-   * Step 5: Fallback to previously used CPU.
-   */
-  if (bpf_cpumask_test_cpu(prev_cpu, l3_mask) && scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
-    cpu = prev_cpu;
-    *is_idle = true;
-    goto out_put_cpumask;
-  }
-
-  /*
-   * Step 6: Pick any idle CPU in L2/L3 domain or globally.
-   */
-  cpu = scx_bpf_pick_idle_cpu(l2_mask, 0);
-  if (cpu >= 0) {
-    *is_idle = true;
-    goto out_put_cpumask;
-  }
-
-  cpu = scx_bpf_pick_idle_cpu(l3_mask, 0);
-  if (cpu >= 0) {
-    *is_idle = true;
-    goto out_put_cpumask;
-  }
-
-  /*
-   * Step 7: Fallback - Pick any CPU in primary domain.
-   */
-  cpu = scx_bpf_pick_any_cpu(p_mask, 0);
 
 out_put_cpumask:
   scx_bpf_put_cpumask(idle_cpumask);

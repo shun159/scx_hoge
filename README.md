@@ -1,23 +1,52 @@
 
 # scx_hoge
 
-This is a user-defined scheduler built for use with sched_ext,
-a Linux kernel feature enabling the implementation of kernel thread schedulers using BPF, which can be dynamically loaded into the kernel.
+An eBPF-based scheduler focused on optimizing cache locality, inspired by scx_flash and scx_bpfland.
 
 ## Overview
 
-`scx_hoge` is a scheduler designed to optimize **CPU cache locality** and **fairness**.
-It dynamically manages task scheduling with a focus on minimizing cache misses, improving interactivity, and ensuring tasks make efficient use of the CPU resources.
+scx_hoge is an eBPF-based scheduler designed to improve L2 and LLC (Last Level Cache) locality while considering SMT (Simultaneous Multi-Threading) efficiency. Inspired by the designs of scx_flash and scx_bpfland, this scheduler doesn't target a specific workload but aims to improve cache hit rates systematically.
 
-## Typical Use Case
+## Design Goals
 
-### **Latency-Sensitive Workloads**
-- Video and audio playback (e.g., 4K video streaming at 60fps without stuttering).  
-- UI/UX rendering tasks requiring minimal latency.  
+1. Maximize Cache Locality
+
+Tasks are scheduled to CPUs sharing the same L2 and LLC cache domains.
+
+2. Optimize SMT Utilization
+
+Idle SMT siblings are prioritized for task dispatch.
+
+3. Fair Task Scheduling
+
+EWMA (Exponential Weighted Moving Average) ensures fair runtime distribution.
+
+4. Interactive Task Awareness
+
+Tasks exhibiting high voluntary context switch rates are prioritized.
+
+## How It Works
+
+1. **Task Initialization:**
+   - Each task is assigned a **`task_ctx`** structure for local storage.
+   - CPU masks (`l2_cpumask`, `llc_cpumask`) are dynamically initialized.
+
+2. **Task Queuing:**
+   - **Interactive Tasks:** Dispatched immediately to local DSQ.  
+   - **Non-Interactive Tasks:** Scheduled across L2, LLC, and Shared DSQ hierarchies.
+
+3. **CPU Selection:**
+   - Idle CPUs are prioritized: **L2 → LLC → Global Queues**.  
+   - SMT-aware scheduling ensures efficient sibling thread utilization.
+
+4. **Task Execution:**
+   - Time slices are dynamically refilled using `task_refill_slice()`.
+
+5. **Task Termination:**
+   - Runtime and voluntary context switch statistics are updated for future scheduling adjustments.
+
 
 ## Production Ready?
 
-**No.**
-
-While `scx_hoge` shows promising results in benchmarks and specific scenarios, it is still under active development. It may not yet meet the reliability and stability requirements for production use in critical environments.  
+**No.** Not optimized for specific workloads. In heavy task migration scenarios, **scheduling overhead** may be noticeable.
 
