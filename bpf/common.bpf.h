@@ -393,14 +393,14 @@ __write_once_size(volatile void *p, void *res, int size)
   })
 
 /*
- * log2___u32 - Compute the base 2 logarithm of a 32-bit exponential value.
+ * log2_u32 - Compute the base 2 logarithm of a 32-bit exponential value.
  * @v: The value for which we're computing the base 2 logarithm.
  */
-static inline __u32
-log2___u32(__u32 v)
+static inline u32
+log2_u32(u32 v)
 {
-  __u32 r;
-  __u32 shift;
+  u32 r;
+  u32 shift;
 
   r = (v > 0xFFFF) << 4;
   v >>= r;
@@ -422,13 +422,13 @@ log2___u32(__u32 v)
  * @v: The value for which we're computing the base 2 logarithm.
  */
 static inline __u32
-log2___u64(__u64 v)
+log2_u64(__u64 v)
 {
   __u32 hi = v >> 32;
   if (hi)
-    return log2___u32(hi) + 32 + 1;
+    return log2_u32(hi) + 32 + 1;
   else
-    return log2___u32(v) + 1;
+    return log2_u32(v) + 1;
 }
 
 #include "compat.bpf.h"

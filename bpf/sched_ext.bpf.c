@@ -35,6 +35,11 @@ extern unsigned CONFIG_HZ __kconfig;
 #define MAX_TASK_WEIGHT 10000
 
 /*
+ * Maximum frequency of task wakeup events / sec.
+ */
+#define MAX_WAKEUP_FREQ 1024
+
+/*
  * Maximum amount of voluntary context switches (this limit allows to prevent
  * spikes or abuse of the nvcsw dynamic).
  */
@@ -153,6 +158,12 @@ struct task_ctx {
   __u64 avg_nvcsw;
 
   /*
+   * Frequency with which a task is blocked (consumer).
+   */
+  u64 blocked_freq;
+  u64 last_blocked_at;
+
+  /*
    * Task's average used time slice.
    */
   __u64 avg_runtime;
@@ -163,6 +174,12 @@ struct task_ctx {
    * Task's deadline.
    */
   __u64 deadline;
+
+  /*
+   * Frequency with which a task wakes other tasks (producer).
+   */
+  u64 waker_freq;
+  u64 last_woke_at;
 
   /*
    * Set to true if the task is classified as interactive.
@@ -268,6 +285,18 @@ calc_avg_clamp(__u64 old_val, __u64 new_val, __u64 low, __u64 high)
   return CLAMP(calc_avg(old_val, new_val), low, high);
 }
 
+/*
+ * Evaluate the average frequency of an event over time.
+ */
+static __u64
+update_freq(__u64 freq, __u64 delta)
+{
+  u64 new_freq;
+
+  new_freq = NSEC_PER_SEC / delta;
+  return calc_avg(freq, new_freq);
+}
+
 /*MAX_AVG_NVCSW
  * Compare two vruntime values, returns true if the first value is less than
  * the second one.
@@ -313,7 +342,13 @@ task_weight(const struct task_struct *p, const struct task_ctx *tctx)
 static __u64
 scale_up_fair(const struct task_struct *p, const struct task_ctx *tctx, __u64 value)
 {
-  return value * task_weight(p, tctx) / 100;
+  /*
+   * Scale the static task weight by the average amount of voluntary
+   * context switches to determine the dynamic weight.
+   */
+  u64 prio = p->scx.weight * CLAMP(tctx->avg_nvcsw, 1, nvcsw_max_thresh ?: 1);
+
+  return CLAMP(prio, 1, MAX_TASK_WEIGHT);
 }
 
 /*
@@ -400,20 +435,44 @@ static __always_inline __u64
 task_deadline(struct task_struct *p, struct task_ctx *tctx)
 {
   __u64 avg_run_scaled, lat_prio, lat_weight;
+  __u64 freq_factor, waker_freq, blocked_freq;
 
+  /*
+   * Calculate the average scaled runtime inversely proportional
+   * to the task's weight.
+   */
   avg_run_scaled = scale_inverse_fair(p, tctx, tctx->avg_runtime);
-  avg_run_scaled = log2___u64(avg_run_scaled);
+  avg_run_scaled = log2_u64(avg_run_scaled + 1);
 
-  lat_prio = scale_up_fair(p, tctx, tctx->avg_nvcsw);
+  /*
+   * Evaluate wake-up and block frequencies for producer/consumer behavior.
+   */
+  waker_freq = CLAMP(tctx->waker_freq, 1, MAX_WAKEUP_FREQ);
+  blocked_freq = CLAMP(tctx->blocked_freq, 1, MAX_WAKEUP_FREQ);
+  freq_factor = (blocked_freq + 1) * (waker_freq + 1) * (waker_freq + 1);
+
+  /*
+   * Calculate latency priority based on both frequencies and runtime.
+   * Favor producer-like tasks more.
+   */
+  lat_prio = log2_u64(freq_factor + 1);
   if (lat_prio > avg_run_scaled)
     lat_prio -= avg_run_scaled;
   else
     lat_prio = 0;
 
-  lat_prio = MIN(lat_prio, max_sched_prio() - 1);
+  if (tctx->is_interactive)
+    lat_prio += CLAMP(waker_freq / 2, 1, 10);
+
+  /*
+   * Translate latency priority to a scheduling weight.
+   */
   lat_weight = sched_prio_to_latency_weight(lat_prio);
 
-  return tctx->avg_runtime * 1024 / lat_weight;
+  /*
+   * Calculate the final deadline based on weighted average runtime.
+   */
+  return tctx->avg_runtime * 100 / lat_weight;
 }
 
 /*
@@ -438,7 +497,7 @@ task_vtime(struct task_struct *p, struct task_ctx *tctx)
 static __always_inline void
 task_refill_slice(struct task_struct *p)
 {
-  p->scx.slice = CLAMP(slice_max / nr_tasks_waiting(), SLICE_MIN, slice_max);
+  p->scx.slice = CLAMP(slice_max / nr_tasks_waiting(), slice_max / 2, slice_max);
 }
 
 static __always_inline int
@@ -517,14 +576,14 @@ task_set_domain(struct task_struct *p, __s32 cpu, const struct cpumask *cpumask)
    * This ensures the task is scheduled on CPUs sharing the same L2 cache,
    * optimizing intermediate-level cache locality.
    */
-  bpf_cpumask_and(l2_mask, cpumask, l2_domain);
+  bpf_cpumask_and(tctx->l2_cpumask, cpumask, l2_domain);
 
   /*
    * Further narrow down the task's CPU mask to CPUs within the same LLC (Last Level Cache) domain.
    * This ensures the task remains within a broader cache-sharing scope
    * while still respecting the L2 domain constraints.
    */
-  bpf_cpumask_and(llc_mask, cast_mask(l2_mask), llc_domain);
+  bpf_cpumask_and(tctx->llc_cpumask, cast_mask(l2_mask), llc_domain);
 
   /*
    * Finalize the task's CPU mask by intersecting the LLC domain mask with the original task's CPU
@@ -697,34 +756,37 @@ out_put_cpumask:
 }
 
 static __always_inline void
-kick_task_cpu(struct task_struct *p)
+kick_task_cpu(struct task_struct *p, struct task_ctx *tctx)
 {
-  __s32 cpu = scx_bpf_task_cpu(p);
-  bool is_idle = false;
+  const struct cpumask *idle_cpumask, *llc_mask;
+  s32 cpu;
 
-  // If the task changed CPU affinity just try to kick any usable idle cpu
-  if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
-    cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
-    if (cpu >= 0) {
-      scx_bpf_kick_cpu(cpu, 0);
-      return;
-    }
+  /*
+   * If the task can only run on a single CPU, it's pointless to wake
+   * up any other CPU, so do nothing in this case.
+   */
+  if (p->nr_cpus_allowed == 1 || p->migration_disabled)
+    return;
+
+  /*
+   * Look for an idle CPU in the task's LLC domain that can
+   * immediately execute the task.
+   *
+   * Note that we do not want to mark the CPU as busy, since we don't
+   * know at this stage if we will actually dispatch any task on it.
+   */
+  llc_mask = cast_mask(tctx->llc_cpumask);
+  if (!llc_mask) {
+    scx_bpf_error("l3 cpumask not initialized");
+    return;
   }
 
-  // For tasks that can run only on a single CPU, we can simply verify if
-  // their only allowed CPU is still idle.
-  if (p->nr_cpus_allowed == 1 || p->migration_disabled) {
-    if (scx_bpf_test_and_clear_cpu_idle(cpu)) {
-      scx_bpf_kick_cpu(cpu, 0);
-      return;
-    }
-  }
+  idle_cpumask = scx_bpf_get_idle_cpumask();
+  cpu = bpf_cpumask_any_and_distribute(llc_mask, idle_cpumask);
+  scx_bpf_put_cpumask(idle_cpumask);
 
-  // Otherwise, try to kick the best idle CPU for the task.
-  cpu = pick_idle_cpu(p, cpu, 0, &is_idle);
-  if (is_idle) {
-    scx_bpf_kick_cpu(cpu, 0);
-  }
+  if (cpu < get_nr_online_cpus())
+    scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
 
 /*
@@ -750,8 +812,7 @@ update_cpuperf_target(struct task_struct *p, struct task_ctx *tctx)
 
   // For interactive tasks, prioritize performance but limit maximum frequency.
   if (tctx->is_interactive) {
-    perf_lvl = SCX_CPUPERF_ONE * 0.8; // Cap at 80% of max frequency.
-    scx_bpf_cpuperf_set(cpu, perf_lvl);
+    scx_bpf_cpuperf_set(cpu, SCX_CPUPERF_ONE);
     return;
   }
 
@@ -763,19 +824,12 @@ update_cpuperf_target(struct task_struct *p, struct task_ctx *tctx)
   if (!cctx)
     return;
 
-  // Ensure the time interval is not too short (minimum 10ms).
   delta_t = now - cctx->last_running;
-  if (delta_t < 10 * NSEC_PER_MSEC)
-    delta_t = 10 * NSEC_PER_MSEC;
-
   delta_runtime = cctx->tot_runtime - cctx->prev_runtime;
-  utilization = (delta_runtime * SCX_CPUPERF_ONE) / delta_t;
+  perf_lvl = delta_runtime * SCX_CPUPERF_ONE / delta_t;
 
-  perf_lvl = MAX(utilization, SCX_CPUPERF_ONE / 2);
-  // frequency adjustment using EWMA
-  perf_lvl = calc_avg(cctx->prev_runtime, perf_lvl);
+  /* Ensure baseline is at least 50% to prevent underperformance */
   perf_lvl = MIN(perf_lvl, SCX_CPUPERF_ONE);
-
   // Apply the dynamic cpuperf scaling factor.
   scx_bpf_cpuperf_set(cpu, perf_lvl);
 
@@ -898,10 +952,7 @@ BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
   // while considering cache locality.
   scx_bpf_dispatch_vtime(p, SHARED_DSQ, SCX_SLICE_DFL, task_vtime(p, tctx), enq_flags);
 
-  // If the task is limited to a subset of CPUs, ensure at least one is active
-  if ((p->nr_cpus_allowed < nr_online_cpus) || p->migration_disabled) {
-    kick_task_cpu(p);
-  }
+  kick_task_cpu(p, tctx);
 }
 
 void
@@ -985,6 +1036,21 @@ BPF_STRUCT_OPS(hoge_running, struct task_struct *p)
 }
 
 void
+BPF_STRUCT_OPS(hoge_quiescent, struct task_struct *p, u64 deq_flags)
+{
+  u64 now = bpf_ktime_get_ns(), delta;
+  struct task_ctx *tctx;
+
+  tctx = try_lookup_task_ctx(p);
+  if (!tctx)
+    return;
+
+  delta = MAX(now - tctx->last_blocked_at, 1);
+  tctx->blocked_freq = update_freq(tctx->blocked_freq, delta);
+  tctx->last_blocked_at = now;
+}
+
+void
 BPF_STRUCT_OPS(hoge_runnable, struct task_struct *p, __u64 enq_flags)
 {
   __u64 now = bpf_ktime_get_ns(), delta;
@@ -997,6 +1063,15 @@ BPF_STRUCT_OPS(hoge_runnable, struct task_struct *p, __u64 enq_flags)
     return;
   }
   tctx->sum_runtime = 0;
+
+  waker = bpf_get_current_task_btf();
+  tctx = try_lookup_task_ctx(waker);
+  if (!tctx)
+    return;
+
+  delta = MAX(now - tctx->last_woke_at, 1);
+  tctx->waker_freq = update_freq(tctx->waker_freq, delta);
+  tctx->last_woke_at = now;
 }
 
 void
@@ -1081,6 +1156,7 @@ struct sched_ext_ops scx_hoge = {
     .enable = (void *)hoge_enable,
     .runnable = (void *)hoge_runnable,
     .running = (void *)hoge_running,
+    .quiescent = (void *)hoge_quiescent,
     .stopping = (void *)hoge_stopping,
     .dispatch = (void *)hoge_dispatch,
     .enqueue = (void *)hoge_enqueue,
