@@ -27,6 +27,8 @@ enum consts {
 
 extern unsigned CONFIG_HZ __kconfig;
 
+#define MAX_CPUS 1024
+
 /*
  * Maximum task weight.
  */
@@ -151,18 +153,6 @@ struct task_ctx {
   __u64 avg_nvcsw;
 
   /*
-   * Frequency with which a task is blocked (consumer).
-   */
-  __u64 blocked_freq;
-  __u64 last_blocked_at;
-
-  /*
-   * Frequency with which a task wakes other tasks (producer).
-   */
-  __u64 waker_freq;
-  __u64 last_woke_at;
-
-  /*
    * Task's average used time slice.
    */
   __u64 avg_runtime;
@@ -227,6 +217,36 @@ calloc_cpumask(struct bpf_cpumask **p_cpumask)
 }
 
 /*
+ * Evaluate the amount of online CPUs.
+ */
+__s32
+get_nr_online_cpus(void)
+{
+  const struct cpumask *online_cpumask;
+  int cpus;
+
+  online_cpumask = scx_bpf_get_online_cpumask();
+  cpus = bpf_cpumask_weight(online_cpumask);
+  scx_bpf_put_cpumask(online_cpumask);
+
+  return cpus;
+}
+
+/*
+ * Return the DSQ ID associated to a CPU, or SHARED_DSQ if the CPU is not
+ * valid.
+ */
+static u64
+cpu_to_dsq(s32 cpu)
+{
+  if (cpu < 0 || cpu >= MAX_CPUS) {
+    scx_bpf_error("Invalid cpu: %d", cpu);
+    return SHARED_DSQ;
+  }
+  return (u64)cpu;
+}
+
+/*
  * Exponential weighted moving average (EWMA).
  *
  * Copied from scx_lavd. Returns the new average as:
@@ -246,18 +266,6 @@ static __u64
 calc_avg_clamp(__u64 old_val, __u64 new_val, __u64 low, __u64 high)
 {
   return CLAMP(calc_avg(old_val, new_val), low, high);
-}
-
-/*
- * Evaluate the average frequency of an event over time.
- */
-static __u64
-update_freq(__u64 freq, __u64 delta)
-{
-  __u64 new_freq;
-
-  new_freq = NSEC_PER_SEC / delta;
-  return calc_avg(freq, new_freq);
 }
 
 /*MAX_AVG_NVCSW
@@ -561,7 +569,11 @@ pick_idle_cpu(struct task_struct *p, __s32 prev_cpu, __u64 wake_flags, bool *is_
   struct task_ctx *tctx;
   struct cpu_ctx *cctx;
   struct task_struct *current = (void *)bpf_get_current_task_btf();
+  int i;
   __s32 cpu = -1;
+  __s32 least_loaded_cpu = -1;
+  __u64 min_queue_len = 0xffffffff;
+  __u64 queue_len;
 
   *is_idle = false;
 
@@ -626,6 +638,23 @@ pick_idle_cpu(struct task_struct *p, __s32 prev_cpu, __u64 wake_flags, bool *is_
       *is_idle = true;
       goto out_put_cpumask;
     }
+  }
+
+  bpf_for(i, 0, get_nr_online_cpus())
+  {
+    if (!bpf_cpumask_test_cpu(i, l3_mask))
+      continue;
+
+    queue_len = scx_bpf_dsq_nr_queued(cpu_to_dsq(i));
+    if (queue_len < min_queue_len) {
+      min_queue_len = queue_len;
+      least_loaded_cpu = i;
+    }
+  }
+
+  if (least_loaded_cpu >= 0) {
+    cpu = least_loaded_cpu;
+    goto out_put_cpumask;
   }
 
   /*
@@ -707,7 +736,7 @@ update_cpuperf_target(struct task_struct *p, struct task_ctx *tctx)
 {
   u64 now = bpf_ktime_get_ns();
   s32 cpu = scx_bpf_task_cpu(p);
-  u64 perf_lvl, delta_runtime, delta_t;
+  u64 perf_lvl, delta_runtime, delta_t, utilization;
   struct cpu_ctx *cctx;
 
   if (cpufreq_perf_lvl >= 0) {
@@ -719,11 +748,10 @@ update_cpuperf_target(struct task_struct *p, struct task_ctx *tctx)
     return;
   }
 
-  /*
-   * Auto mode: always tset max performance for interactive tasks.
-   */
+  // For interactive tasks, prioritize performance but limit maximum frequency.
   if (tctx->is_interactive) {
-    scx_bpf_cpuperf_set(cpu, SCX_CPUPERF_ONE);
+    perf_lvl = SCX_CPUPERF_ONE * 0.8; // Cap at 80% of max frequency.
+    scx_bpf_cpuperf_set(cpu, perf_lvl);
     return;
   }
 
@@ -735,46 +763,24 @@ update_cpuperf_target(struct task_struct *p, struct task_ctx *tctx)
   if (!cctx)
     return;
 
-  /*
-   * Evaluate dynamic cpuperf scaling factor using the average CPU
-   * utilization, normalized in the range [0 .. SCX_CPUPERF_ONE].
-   */
+  // Ensure the time interval is not too short (minimum 10ms).
   delta_t = now - cctx->last_running;
-  delta_runtime = cctx->tot_runtime - cctx->prev_runtime;
-  perf_lvl = delta_runtime * SCX_CPUPERF_ONE / delta_t;
+  if (delta_t < 10 * NSEC_PER_MSEC)
+    delta_t = 10 * NSEC_PER_MSEC;
 
-  /*
-   * If interactive tasks detection is disabled, always boost the
-   * frequency to make sure it's at least 50%, to prevent being too
-   * conservative.
-   */
-  if (!nvcsw_max_thresh)
-    perf_lvl += SCX_CPUPERF_ONE / 2;
+  delta_runtime = cctx->tot_runtime - cctx->prev_runtime;
+  utilization = (delta_runtime * SCX_CPUPERF_ONE) / delta_t;
+
+  perf_lvl = MAX(utilization, SCX_CPUPERF_ONE / 2);
+  // frequency adjustment using EWMA
+  perf_lvl = calc_avg(cctx->prev_runtime, perf_lvl);
   perf_lvl = MIN(perf_lvl, SCX_CPUPERF_ONE);
 
-  /*
-   * Apply the dynamic cpuperf scaling factor.
-   */
+  // Apply the dynamic cpuperf scaling factor.
   scx_bpf_cpuperf_set(cpu, perf_lvl);
 
-  cctx->last_running = bpf_ktime_get_ns();
+  cctx->last_running = now;
   cctx->prev_runtime = cctx->tot_runtime;
-}
-
-/*
- * Evaluate the amount of online CPUs.
- */
-s32
-get_nr_online_cpus(void)
-{
-  const struct cpumask *online_cpumask;
-  int cpus;
-
-  online_cpumask = scx_bpf_get_online_cpumask();
-  cpus = bpf_cpumask_weight(online_cpumask);
-  scx_bpf_put_cpumask(online_cpumask);
-
-  return cpus;
 }
 
 SEC("syscall")
@@ -832,6 +838,8 @@ void
 BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
 {
   struct task_ctx *tctx;
+  struct cpu_ctx *cctx;
+  const struct cpumask *l2_domain, *llc_domain;
   __s32 cpu;
 
   // prioritize kthreads. dispatch them immediately to the local DSQ
@@ -854,6 +862,37 @@ BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
   tctx = try_lookup_task_ctx(p);
   if (!tctx)
     return;
+
+  l2_domain = cast_mask(tctx->l2_cpumask);
+  if (!l2_domain)
+    l2_domain = p->cpus_ptr;
+
+  llc_domain = cast_mask(tctx->llc_cpumask);
+  if (!llc_domain)
+    llc_domain = p->cpus_ptr;
+
+  // dispatch interactive task immediately
+  if (tctx->is_interactive) {
+    scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags | SCX_ENQ_PREEMPT);
+    return;
+  }
+
+  // dispatch the task considering L2/LLC cache locality
+  if (bpf_cpumask_weight(l2_domain) > 0) {
+    cpu = scx_bpf_pick_idle_cpu(l2_domain, SCX_PICK_IDLE_CORE);
+    if (cpu >= 0) {
+      scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
+      return;
+    }
+  }
+
+  if (bpf_cpumask_weight(llc_domain) > 0) {
+    cpu = scx_bpf_pick_idle_cpu(llc_domain, SCX_PICK_IDLE_CORE);
+    if (cpu >= 0) {
+      scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
+      return;
+    }
+  }
 
   // Insert the task into the shared DSQ using its virtual runtime (vtime)
   // while considering cache locality.
@@ -925,30 +964,6 @@ BPF_STRUCT_OPS(hoge_stopping, struct task_struct *p, bool runnable)
 }
 
 void
-BPF_STRUCT_OPS(hoge_quiescent, struct task_struct *p, u64 deq_flags)
-{
-  u64 now = bpf_ktime_get_ns(), delta;
-  struct task_ctx *tctx;
-
-  tctx = try_lookup_task_ctx(p);
-  if (!tctx)
-    return;
-
-  /*
-   * Update the frequency of task blocking events.
-   * This helps in identifying tasks that frequently enter a blocked state.
-   */
-  delta = MAX(now - tctx->last_blocked_at, 1);
-  tctx->blocked_freq = update_freq(tctx->blocked_freq, delta);
-
-  /*
-   * Update the timestamp of the last blocking event.
-   * This ensures the blocking frequency calculation remains accurate.
-   */
-  tctx->last_blocked_at = now;
-}
-
-void
 BPF_STRUCT_OPS(hoge_running, struct task_struct *p)
 {
   struct task_ctx *tctx;
@@ -982,20 +997,6 @@ BPF_STRUCT_OPS(hoge_runnable, struct task_struct *p, __u64 enq_flags)
     return;
   }
   tctx->sum_runtime = 0;
-
-  waker = bpf_get_current_task_btf();
-  if (!waker) {
-    return;
-  }
-
-  struct task_ctx *waker_ctx = try_lookup_task_ctx(waker);
-  if (!waker_ctx) {
-    return;
-  }
-
-  delta = MAX(now - waker_ctx->last_woke_at, 1);
-  waker_ctx->waker_freq = update_freq(waker_ctx->waker_freq, delta);
-  waker_ctx->last_woke_at = now;
 }
 
 void
@@ -1016,8 +1017,6 @@ BPF_STRUCT_OPS(hoge_enable, struct task_struct *p)
   tctx->avg_runtime = SLICE_MIN;
   tctx->nvcsw = 0;
   tctx->nvcsw_ts = now;
-  tctx->last_woke_at = now;
-  tctx->last_blocked_at = now;
   tctx->deadline = p->scx.dsq_vtime + task_deadline(p, tctx);
 }
 
@@ -1083,7 +1082,6 @@ struct sched_ext_ops scx_hoge = {
     .runnable = (void *)hoge_runnable,
     .running = (void *)hoge_running,
     .stopping = (void *)hoge_stopping,
-    .quiescent = (void *)hoge_quiescent,
     .dispatch = (void *)hoge_dispatch,
     .enqueue = (void *)hoge_enqueue,
     .select_cpu = (void *)hoge_select_cpu,
