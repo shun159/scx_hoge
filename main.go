@@ -42,6 +42,17 @@ func enableSiblingCpu(objs *bpfObjects, cacheLvl, cpuID, sibID int) error {
 	return nil
 }
 
+func attachProgram(prog *ebpf.Program, name string) link.Link {
+	tracingLink, err := link.AttachTracing(link.TracingOptions{
+		Program: prog,
+	})
+	if err != nil {
+		log.Fatalf("Failed to attach program %s: %v", name, err)
+	}
+	log.Printf("Successfully attached program: %s", name)
+	return tracingLink
+}
+
 func main() {
 	// Allow the current process to lock memory for eBPF resources.
 	if err := rlimit.RemoveMemlock(); err != nil {
@@ -53,6 +64,28 @@ func main() {
 		log.Fatalf("loading objects: %v", errors.WithStack(err))
 	}
 	defer objs.Close()
+
+	// Attach programs
+	links := []link.Link{
+		attachProgram(objs.FentrySysRead, "FentrySysRead"),
+		attachProgram(objs.FexitSysRead, "FexitSysRead"),
+		attachProgram(objs.FentrySysAccept, "FentrySysAccept"),
+		attachProgram(objs.FexitSysAccept, "FexitSysAccept"),
+		attachProgram(objs.FentrySysPoll, "FentrySysPoll"),
+		attachProgram(objs.FexitSysPoll, "FexitSysPoll"),
+		attachProgram(objs.FentrySysRecvfrom, "FentrySysRecvfrom"),
+		attachProgram(objs.FexitSysRecvfrom, "FexitSysRecvfrom"),
+		attachProgram(objs.FentrySysSendto, "FentrySysSendto"),
+		attachProgram(objs.FexitSysSendto, "FexitSysSendto"),
+	}
+
+	defer func() {
+		for _, l := range links {
+			if l != nil {
+				l.Close()
+			}
+		}
+	}()
 
 	topology, err := scx_utils.NewTopology()
 	if err != nil {

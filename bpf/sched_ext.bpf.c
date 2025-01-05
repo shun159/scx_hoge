@@ -39,6 +39,8 @@ extern unsigned CONFIG_HZ __kconfig;
  */
 #define MAX_WAKEUP_FREQ 1024
 
+#define IO_FREQ_THRESHOLD 300
+
 /*
  * Maximum amount of voluntary context switches (this limit allows to prevent
  * spikes or abuse of the nvcsw dynamic).
@@ -185,6 +187,14 @@ struct task_ctx {
    * Set to true if the task is classified as interactive.
    */
   bool is_interactive;
+
+  // I/O specific members
+  bool is_io_task;        // Flag indicating I/O-bound task
+  u64 io_start_time;      // Timestamp when I/O started
+  u64 io_completion_time; // Predicted I/O completion time
+  u64 avg_io_latency;     // Average I/O latency
+  u64 last_io_blocked;    // Timestamp of last I/O block event
+  u64 io_freq;            // Frequency of I/O events
 };
 
 /* Map that contains task-local storage. */
@@ -295,6 +305,14 @@ update_freq(__u64 freq, __u64 delta)
 
   new_freq = NSEC_PER_SEC / delta;
   return calc_avg(freq, new_freq);
+}
+
+// Return true if the task performs I/O operation, false instead.
+static __always_inline bool
+is_io_task_ready(struct task_ctx *tctx)
+{
+  u64 now = bpf_ktime_get_ns();
+  return (tctx->is_io_task && (now >= tctx->io_completion_time));
 }
 
 /*MAX_AVG_NVCSW
@@ -464,6 +482,10 @@ task_deadline(struct task_struct *p, struct task_ctx *tctx)
   if (tctx->is_interactive)
     lat_prio += CLAMP(waker_freq / 2, 1, 10);
 
+  // I/O-bound tasks get a lower (shorter) deadline.
+  if (tctx->is_io_task)
+    lat_prio = MIN(lat_prio + 5, max_sched_prio() - 1);
+
   /*
    * Translate latency priority to a scheduling weight.
    */
@@ -472,7 +494,11 @@ task_deadline(struct task_struct *p, struct task_ctx *tctx)
   /*
    * Calculate the final deadline based on weighted average runtime.
    */
-  return tctx->avg_runtime * 100 / lat_weight;
+  if (tctx->io_freq > IO_FREQ_THRESHOLD) {
+    return tctx->avg_runtime * 50 / lat_weight;
+  } else {
+    return tctx->avg_runtime * 100 / lat_weight;
+  }
 }
 
 /*
@@ -833,6 +859,186 @@ enable_sibling_cpu(struct domain_arg *input)
   return err;
 }
 
+SEC("fentry/__x64_sys_read")
+int
+BPF_PROG(fentry_sys_read, unsigned int fd, char *buf, size_t count)
+{
+  struct task_struct *p = (void *)bpf_get_current_task_btf();
+  struct task_ctx *tctx = try_lookup_task_ctx(p);
+
+  if (!tctx)
+    return 0;
+
+  tctx->is_io_task = true;
+  tctx->io_start_time = bpf_ktime_get_ns();
+
+  return 0;
+}
+
+SEC("fexit/__x64_sys_read")
+int
+BPF_PROG(fexit_sys_read, unsigned int fd, char *buf, size_t count, ssize_t ret)
+{
+  struct task_struct *p = (void *)bpf_get_current_task_btf();
+  struct task_ctx *tctx = try_lookup_task_ctx(p);
+
+  if (!tctx)
+    return 0;
+
+  u64 now = bpf_ktime_get_ns();
+  u64 io_duration = now - tctx->io_start_time;
+
+  tctx->is_io_task = false;
+  tctx->avg_io_latency = calc_avg(tctx->avg_io_latency, io_duration);
+  tctx->io_completion_time = now;
+
+  return 0;
+}
+
+SEC("fentry/__x64_sys_recvfrom")
+int
+BPF_PROG(fentry_sys_recvfrom, int sockfd, void *buf, size_t len, int flags)
+{
+  struct task_struct *p = (void *)bpf_get_current_task_btf();
+  struct task_ctx *tctx = try_lookup_task_ctx(p);
+
+  if (!tctx)
+    return 0;
+
+  tctx->is_io_task = true;
+  tctx->io_start_time = bpf_ktime_get_ns();
+
+  return 0;
+}
+
+SEC("fentry/__x64_sys_sendto")
+int
+BPF_PROG(fentry_sys_sendto, int sockfd, const void *buf, size_t len, int flags)
+{
+  struct task_struct *p = (void *)bpf_get_current_task_btf();
+  struct task_ctx *tctx = try_lookup_task_ctx(p);
+
+  if (!tctx)
+    return 0;
+
+  tctx->is_io_task = true;
+  tctx->io_start_time = bpf_ktime_get_ns();
+
+  return 0;
+}
+
+SEC("fexit/__x64_sys_recvfrom")
+int
+BPF_PROG(fexit_sys_recvfrom, int sockfd, void *buf, size_t len, int flags, ssize_t ret)
+{
+  struct task_struct *p = (void *)bpf_get_current_task_btf();
+  struct task_ctx *tctx = try_lookup_task_ctx(p);
+
+  if (!tctx)
+    return 0;
+
+  u64 now = bpf_ktime_get_ns();
+  u64 io_duration = now - tctx->io_start_time;
+
+  tctx->is_io_task = false;
+  tctx->avg_io_latency = calc_avg(tctx->avg_io_latency, io_duration);
+  tctx->io_completion_time = now;
+
+  return 0;
+}
+
+SEC("fexit/__x64_sys_sendto")
+int
+BPF_PROG(fexit_sys_sendto, int sockfd, const void *buf, size_t len, int flags, ssize_t ret)
+{
+  struct task_struct *p = (void *)bpf_get_current_task_btf();
+  struct task_ctx *tctx = try_lookup_task_ctx(p);
+
+  if (!tctx)
+    return 0;
+
+  u64 now = bpf_ktime_get_ns();
+  u64 io_duration = now - tctx->io_start_time;
+
+  tctx->is_io_task = false;
+  tctx->avg_io_latency = calc_avg(tctx->avg_io_latency, io_duration);
+  tctx->io_completion_time = now;
+
+  return 0;
+}
+
+SEC("fentry/__x64_sys_accept")
+int
+BPF_PROG(fentry_sys_accept, int sockfd, struct sockaddr *addr, void *addrlen)
+{
+  struct task_struct *p = (void *)bpf_get_current_task_btf();
+  struct task_ctx *tctx = try_lookup_task_ctx(p);
+
+  if (!tctx)
+    return 0;
+
+  tctx->is_io_task = true;
+  tctx->io_start_time = bpf_ktime_get_ns();
+
+  return 0;
+}
+
+SEC("fexit/__x64_sys_accept")
+int
+BPF_PROG(fexit_sys_accept, int sockfd, struct sockaddr *addr, void *addrlen, int ret)
+{
+  struct task_struct *p = (void *)bpf_get_current_task_btf();
+  struct task_ctx *tctx = try_lookup_task_ctx(p);
+
+  if (!tctx)
+    return 0;
+
+  u64 now = bpf_ktime_get_ns();
+  u64 io_duration = now - tctx->io_start_time;
+
+  tctx->is_io_task = false;
+  tctx->avg_io_latency = calc_avg(tctx->avg_io_latency, io_duration);
+  tctx->io_completion_time = now;
+
+  return 0;
+}
+
+SEC("fentry/__x64_sys_poll")
+int
+BPF_PROG(fentry_sys_poll, struct pollfd *fds, __u32 nfds, int timeout)
+{
+  struct task_struct *p = (void *)bpf_get_current_task_btf();
+  struct task_ctx *tctx = try_lookup_task_ctx(p);
+
+  if (!tctx)
+    return 0;
+
+  tctx->is_io_task = true;
+  tctx->io_start_time = bpf_ktime_get_ns();
+
+  return 0;
+}
+
+SEC("fexit/__x64_sys_poll")
+int
+BPF_PROG(fexit_sys_poll, struct pollfd *fds, __u32 nfds, int timeout, int ret)
+{
+  struct task_struct *p = (void *)bpf_get_current_task_btf();
+  struct task_ctx *tctx = try_lookup_task_ctx(p);
+
+  if (!tctx)
+    return 0;
+
+  u64 now = bpf_ktime_get_ns();
+  u64 io_duration = now - tctx->io_start_time;
+
+  tctx->is_io_task = false;
+  tctx->avg_io_latency = calc_avg(tctx->avg_io_latency, io_duration);
+  tctx->io_completion_time = now;
+
+  return 0;
+}
+
 __s32
 BPF_STRUCT_OPS(hoge_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
@@ -853,7 +1059,7 @@ BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
 {
   struct task_ctx *tctx;
   struct cpu_ctx *cctx;
-  const struct cpumask *l2_domain, *llc_domain;
+  const struct cpumask *primary, *l2_domain, *llc_domain;
   __s32 cpu;
 
   // prioritize kthreads. dispatch them immediately to the local DSQ
@@ -877,6 +1083,10 @@ BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
   if (!tctx)
     return;
 
+  primary = cast_mask(tctx->cpumask);
+  if (!primary)
+    primary = p->cpus_ptr;
+
   l2_domain = cast_mask(tctx->l2_cpumask);
   if (!l2_domain)
     l2_domain = p->cpus_ptr;
@@ -884,6 +1094,14 @@ BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
   llc_domain = cast_mask(tctx->llc_cpumask);
   if (!llc_domain)
     llc_domain = p->cpus_ptr;
+
+  // Prioritize handle I/O task. dispatch them immediately to the local DSQ.
+  if (tctx->io_freq > IO_FREQ_THRESHOLD) {
+    cpu = scx_bpf_pick_any_cpu(primary, 0);
+    p->scx.slice = CLAMP(slice_max / 4, SLICE_MIN, slice_max / 2);
+    scx_bpf_dispatch(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, enq_flags | SCX_ENQ_PREEMPT);
+    return;
+  }
 
   // dispatch interactive task immediately
   if (tctx->is_interactive) {
@@ -895,7 +1113,7 @@ BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
   if (bpf_cpumask_weight(l2_domain) > 0) {
     cpu = scx_bpf_pick_idle_cpu(l2_domain, SCX_PICK_IDLE_CORE);
     if (cpu >= 0) {
-      scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
+      scx_bpf_dispatch(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, enq_flags);
       return;
     }
   }
@@ -903,7 +1121,7 @@ BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
   if (bpf_cpumask_weight(llc_domain) > 0) {
     cpu = scx_bpf_pick_idle_cpu(llc_domain, SCX_PICK_IDLE_CORE);
     if (cpu >= 0) {
-      scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
+      scx_bpf_dispatch(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, enq_flags);
       return;
     }
   }
@@ -1008,6 +1226,13 @@ BPF_STRUCT_OPS(hoge_quiescent, struct task_struct *p, u64 deq_flags)
   delta = MAX(now - tctx->last_blocked_at, 1);
   tctx->blocked_freq = update_freq(tctx->blocked_freq, delta);
   tctx->last_blocked_at = now;
+
+  if (!tctx->is_io_task) {
+    tctx->is_io_task = true; // Fallback assumption
+    tctx->io_start_time = now;
+    tctx->io_freq = update_freq(tctx->io_freq, delta);
+    tctx->io_completion_time = now + (SLICE_MIN / 2); // Predict shorter deadline
+  }
 }
 
 void
@@ -1032,6 +1257,16 @@ BPF_STRUCT_OPS(hoge_runnable, struct task_struct *p, __u64 enq_flags)
   delta = MAX(now - tctx->last_woke_at, 1);
   tctx->waker_freq = update_freq(tctx->waker_freq, delta);
   tctx->last_woke_at = now;
+
+  if (!tctx->is_io_task) {
+    delta = MAX(now - tctx->last_woke_at, 1);
+
+    tctx->is_io_task = false; // Clear I/O-bound flag
+    tctx->avg_io_latency = calc_avg(tctx->avg_io_latency, delta);
+    tctx->io_completion_time = now;
+    tctx->last_io_blocked = now;
+    tctx->io_freq = update_freq(tctx->io_freq, delta);
+  }
 }
 
 void
@@ -1082,6 +1317,14 @@ BPF_STRUCT_OPS(hoge_init_task, struct task_struct *p, struct scx_init_task_args 
   INIT_TASK_CPUMASK(tctx, cpumask, llc_cpumask);
 
   task_set_domain(p, cpu, p->cpus_ptr);
+
+  // Initialize I/O-related fields
+  tctx->is_io_task = false;
+  tctx->io_start_time = 0;
+  tctx->io_completion_time = 0;
+  tctx->avg_io_latency = 0;
+  tctx->last_io_blocked = 0;
+  tctx->io_freq = 0;
 
   return 0;
 }
