@@ -523,7 +523,15 @@ task_vtime(struct task_struct *p, struct task_ctx *tctx)
 static __always_inline void
 task_refill_slice(struct task_struct *p)
 {
-  p->scx.slice = CLAMP(slice_max / nr_tasks_waiting(), slice_max / 2, slice_max);
+  struct task_ctx *tctx;
+
+  tctx = try_lookup_task_ctx(p);
+  if (!tctx) {
+    p->scx.slice = CLAMP(slice_max / nr_tasks_waiting(), slice_max / 2, slice_max);
+    return;
+  }
+  if (tctx->is_io_task)
+    p->scx.slice = CLAMP(slice_max / 2, SLICE_MIN, slice_max);
 }
 
 static __always_inline int
@@ -1073,7 +1081,7 @@ BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
   if ((p->nr_cpus_allowed == 1) || p->migration_disabled) {
     cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
     if (cpu >= 0) {
-      scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
+      scx_bpf_dispatch(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, enq_flags);
       __sync_fetch_and_add(&nr_direct_dispatches, 1);
       return;
     }
@@ -1097,8 +1105,8 @@ BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
 
   // Prioritize handle I/O task. dispatch them immediately to the local DSQ.
   if (tctx->io_freq > IO_FREQ_THRESHOLD) {
-    cpu = scx_bpf_pick_any_cpu(primary, 0);
     p->scx.slice = CLAMP(slice_max / 4, SLICE_MIN, slice_max / 2);
+    cpu = scx_bpf_pick_idle_cpu(primary, 0);
     scx_bpf_dispatch(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, enq_flags | SCX_ENQ_PREEMPT);
     return;
   }
