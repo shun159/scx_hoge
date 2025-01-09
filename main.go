@@ -15,7 +15,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// go:generate go run github.com/cilium/ebpf/cmd/bpf2go -no-global-types -target amd64 bpf bpf/sched_ext.bpf.c -- -Wno-compare-distinct-pointer-types -Wno-int-conversion -Wnull-character -g -c -O2 -D__KERNEL__
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -no-global-types -target amd64 bpf bpf/sched_ext.bpf.c -- -Wno-compare-distinct-pointer-types -Wno-int-conversion -Wnull-character -g -c -O2 -D__KERNEL__
 
 // DomainArg defines the sibling CPU relationship for scheduling domains.
 type DomainArg struct {
@@ -77,6 +77,8 @@ func attachPrograms(objs *bpfObjects) []link.Link {
 		"FexitSysRecvfrom":  objs.FexitSysRecvfrom,
 		"FentrySysSendto":   objs.FentrySysSendto,
 		"FexitSysSendto":    objs.FexitSysSendto,
+		"FentrySysFutex":    objs.FentrySysFutex,
+		"FexitSysFutex":     objs.FexitSysFutex,
 	}
 
 	var links []link.Link

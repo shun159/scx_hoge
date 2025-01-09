@@ -494,7 +494,7 @@ task_deadline(struct task_struct *p, struct task_ctx *tctx)
   /*
    * Calculate the final deadline based on weighted average runtime.
    */
-  if (tctx->io_freq > IO_FREQ_THRESHOLD) {
+  if (tctx->is_io_task) {
     return tctx->avg_runtime * 50 / lat_weight;
   } else {
     return tctx->avg_runtime * 100 / lat_weight;
@@ -651,9 +651,39 @@ is_wake_sync(const struct task_struct *p,
   return false;
 }
 
-/*
- * Find an idle CPU in the system.
- */
+// Find the least loaded CPU within the specified mask
+// Returns the CPU with the smallest queue length, or an error code if none found
+static __always_inline __s32
+find_least_loaded_cpu(const struct cpumask *mask)
+{
+  __s32 i, cpu = -1;
+  __u64 min_queue_len = 0xffffffff;
+  __u64 queue_len;
+  __s32 candidate_cpu = -1;
+
+  if (!mask) {
+    scx_bpf_error("find_least_loaded_cpu: invalid cpumask");
+    return -EINVAL;
+  }
+
+  // Iterate through all online CPUs and find the least loaded CPU in the mask
+  bpf_for(i, 0, get_nr_online_cpus())
+  {
+    if (!bpf_cpumask_test_cpu(i, mask))
+      continue;
+
+    queue_len = scx_bpf_dsq_nr_queued(cpu_to_dsq(i));
+    if (queue_len < min_queue_len) {
+      min_queue_len = queue_len;
+      candidate_cpu = i;
+    }
+  }
+
+  return candidate_cpu >= 0 ? candidate_cpu : -ENOENT;
+}
+
+// Find an idle or least-loaded CPU for a task.
+// This function selects the optimal CPU based on task type and system state.
 static __s32
 pick_idle_cpu(struct task_struct *p, __s32 prev_cpu, __u64 wake_flags, bool *is_idle)
 {
@@ -662,15 +692,10 @@ pick_idle_cpu(struct task_struct *p, __s32 prev_cpu, __u64 wake_flags, bool *is_
   struct task_ctx *tctx;
   struct cpu_ctx *cctx;
   struct task_struct *current = (void *)bpf_get_current_task_btf();
-  int i;
   __s32 cpu = -1;
-  __s32 least_loaded_cpu = -1;
-  __u64 min_queue_len = 0xffffffff;
-  __u64 queue_len;
 
   *is_idle = false;
 
-  // Fetch task and CPU contexts
   tctx = try_lookup_task_ctx(p);
   if (!tctx)
     return -ENOENT;
@@ -693,9 +718,6 @@ pick_idle_cpu(struct task_struct *p, __s32 prev_cpu, __u64 wake_flags, bool *is_
     goto out_put_cpumask;
   }
 
-  /*
-   * Step 1: WAKE_SYNC - Prioritize CPU used by the waker task.
-   */
   if (is_wake_sync(p, current, bpf_get_smp_processor_id(), prev_cpu, wake_flags)) {
     if (bpf_cpumask_test_cpu(prev_cpu, l3_mask) && scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
       cpu = prev_cpu;
@@ -704,39 +726,36 @@ pick_idle_cpu(struct task_struct *p, __s32 prev_cpu, __u64 wake_flags, bool *is_
     }
   }
 
-  /*
-   * Step 2: Prioritize idle CPUs in L2 cache domain.
-   */
+  // least loaded CPU, even if it's not idle
+  if (tctx->is_io_task) {
+    cpu = find_least_loaded_cpu(l3_mask);
+    if (cpu >= 0) {
+      *is_idle = false;
+      goto out_put_cpumask;
+    }
+  }
+
+  // Prioritize idle CPUs in L2 cache domain.
   cpu = scx_bpf_pick_idle_cpu(l2_mask, 0);
   if (cpu >= 0) {
     *is_idle = true;
     goto out_put_cpumask;
   }
 
-  /*
-   * Step 3: Prioritize idle CPUs in L3 cache domain.
-   */
+  // Prioritize idle CPUs in L3 cache domain.
   cpu = scx_bpf_pick_idle_cpu(l3_mask, 0);
   if (cpu >= 0) {
     *is_idle = true;
     goto out_put_cpumask;
   }
 
-  bpf_for(i, 0, get_nr_online_cpus())
-  {
-    if (!bpf_cpumask_test_cpu(i, l3_mask))
-      continue;
-
-    queue_len = scx_bpf_dsq_nr_queued(cpu_to_dsq(i));
-    if (queue_len < min_queue_len) {
-      min_queue_len = queue_len;
-      least_loaded_cpu = i;
+  // Prioritize idle CPUs in SMT
+  if (idle_smtmask && bpf_cpumask_weight(idle_smtmask) > 0) {
+    cpu = scx_bpf_pick_idle_cpu(idle_smtmask, SCX_PICK_IDLE_CORE);
+    if (cpu >= 0) {
+      *is_idle = true;
+      goto out_put_cpumask;
     }
-  }
-
-  if (least_loaded_cpu >= 0) {
-    cpu = least_loaded_cpu;
-    goto out_put_cpumask;
   }
 
 out_put_cpumask:
@@ -762,13 +781,6 @@ kick_task_cpu(struct task_struct *p, struct task_ctx *tctx)
   if (p->nr_cpus_allowed == 1 || p->migration_disabled)
     return;
 
-  /*
-   * Look for an idle CPU in the task's LLC domain that can
-   * immediately execute the task.
-   *
-   * Note that we do not want to mark the CPU as busy, since we don't
-   * know at this stage if we will actually dispatch any task on it.
-   */
   llc_mask = cast_mask(tctx->llc_cpumask);
   if (!llc_mask) {
     scx_bpf_error("l3 cpumask not initialized");
@@ -821,10 +833,7 @@ update_cpuperf_target(struct task_struct *p, struct task_ctx *tctx)
   delta_t = now - cctx->last_running;
   delta_runtime = cctx->tot_runtime - cctx->prev_runtime;
   perf_lvl = delta_runtime * SCX_CPUPERF_ONE / delta_t;
-
-  /* Ensure baseline is at least 50% to prevent underperformance */
   perf_lvl = MIN(perf_lvl, SCX_CPUPERF_ONE);
-  // Apply the dynamic cpuperf scaling factor.
   scx_bpf_cpuperf_set(cpu, perf_lvl);
 
   cctx->last_running = now;
@@ -879,6 +888,7 @@ BPF_PROG(fentry_sys_read, unsigned int fd, char *buf, size_t count)
 
   tctx->is_io_task = true;
   tctx->io_start_time = bpf_ktime_get_ns();
+  tctx->io_completion_time = bpf_ktime_get_ns() + (SLICE_MIN / 2); // Predict shorter deadline
 
   return 0;
 }
@@ -899,6 +909,7 @@ BPF_PROG(fexit_sys_read, unsigned int fd, char *buf, size_t count, ssize_t ret)
   tctx->is_io_task = false;
   tctx->avg_io_latency = calc_avg(tctx->avg_io_latency, io_duration);
   tctx->io_completion_time = now;
+  tctx->io_freq = update_freq(tctx->io_freq, MAX(now - tctx->last_woke_at, 1));
 
   return 0;
 }
@@ -915,6 +926,7 @@ BPF_PROG(fentry_sys_recvfrom, int sockfd, void *buf, size_t len, int flags)
 
   tctx->is_io_task = true;
   tctx->io_start_time = bpf_ktime_get_ns();
+  tctx->io_completion_time = bpf_ktime_get_ns() + (SLICE_MIN / 2); // Predict shorter deadline
 
   return 0;
 }
@@ -931,6 +943,7 @@ BPF_PROG(fentry_sys_sendto, int sockfd, const void *buf, size_t len, int flags)
 
   tctx->is_io_task = true;
   tctx->io_start_time = bpf_ktime_get_ns();
+  tctx->io_completion_time = bpf_ktime_get_ns() + (SLICE_MIN / 2); // Predict shorter deadline
 
   return 0;
 }
@@ -951,6 +964,7 @@ BPF_PROG(fexit_sys_recvfrom, int sockfd, void *buf, size_t len, int flags, ssize
   tctx->is_io_task = false;
   tctx->avg_io_latency = calc_avg(tctx->avg_io_latency, io_duration);
   tctx->io_completion_time = now;
+  tctx->io_freq = update_freq(tctx->io_freq, MAX(now - tctx->last_woke_at, 1));
 
   return 0;
 }
@@ -971,6 +985,7 @@ BPF_PROG(fexit_sys_sendto, int sockfd, const void *buf, size_t len, int flags, s
   tctx->is_io_task = false;
   tctx->avg_io_latency = calc_avg(tctx->avg_io_latency, io_duration);
   tctx->io_completion_time = now;
+  tctx->io_freq = update_freq(tctx->io_freq, MAX(now - tctx->last_woke_at, 1));
 
   return 0;
 }
@@ -987,6 +1002,7 @@ BPF_PROG(fentry_sys_accept, int sockfd, struct sockaddr *addr, void *addrlen)
 
   tctx->is_io_task = true;
   tctx->io_start_time = bpf_ktime_get_ns();
+  tctx->io_completion_time = bpf_ktime_get_ns() + (SLICE_MIN / 2); // Predict shorter deadline
 
   return 0;
 }
@@ -1007,6 +1023,7 @@ BPF_PROG(fexit_sys_accept, int sockfd, struct sockaddr *addr, void *addrlen, int
   tctx->is_io_task = false;
   tctx->avg_io_latency = calc_avg(tctx->avg_io_latency, io_duration);
   tctx->io_completion_time = now;
+  tctx->io_freq = update_freq(tctx->io_freq, MAX(now - tctx->last_woke_at, 1));
 
   return 0;
 }
@@ -1023,6 +1040,7 @@ BPF_PROG(fentry_sys_poll, struct pollfd *fds, __u32 nfds, int timeout)
 
   tctx->is_io_task = true;
   tctx->io_start_time = bpf_ktime_get_ns();
+  tctx->io_completion_time = bpf_ktime_get_ns() + (SLICE_MIN / 2); // Predict shorter deadline
 
   return 0;
 }
@@ -1043,6 +1061,45 @@ BPF_PROG(fexit_sys_poll, struct pollfd *fds, __u32 nfds, int timeout, int ret)
   tctx->is_io_task = false;
   tctx->avg_io_latency = calc_avg(tctx->avg_io_latency, io_duration);
   tctx->io_completion_time = now;
+  tctx->io_freq = update_freq(tctx->io_freq, MAX(now - tctx->last_woke_at, 1));
+
+  return 0;
+}
+
+SEC("fentry/__x64_sys_futex")
+int
+BPF_PROG(fentry_sys_futex, struct pollfd *fds, __u32 nfds, int timeout)
+{
+  struct task_struct *p = (void *)bpf_get_current_task_btf();
+  struct task_ctx *tctx = try_lookup_task_ctx(p);
+
+  if (!tctx)
+    return 0;
+
+  tctx->is_io_task = true;
+  tctx->io_start_time = bpf_ktime_get_ns();
+  tctx->io_completion_time = bpf_ktime_get_ns() + (SLICE_MIN / 2); // Predict shorter deadline
+
+  return 0;
+}
+
+SEC("fexit/__x64_sys_futex")
+int
+BPF_PROG(fexit_sys_futex, struct pollfd *fds, __u32 nfds, int timeout, int ret)
+{
+  struct task_struct *p = (void *)bpf_get_current_task_btf();
+  struct task_ctx *tctx = try_lookup_task_ctx(p);
+
+  if (!tctx)
+    return 0;
+
+  u64 now = bpf_ktime_get_ns();
+  u64 io_duration = now - tctx->io_start_time;
+
+  tctx->is_io_task = false;
+  tctx->avg_io_latency = calc_avg(tctx->avg_io_latency, io_duration);
+  tctx->io_completion_time = now;
+  tctx->io_freq = update_freq(tctx->io_freq, MAX(now - tctx->last_woke_at, 1));
 
   return 0;
 }
@@ -1067,7 +1124,7 @@ BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
 {
   struct task_ctx *tctx;
   struct cpu_ctx *cctx;
-  const struct cpumask *primary, *l2_domain, *llc_domain;
+  const struct cpumask *primary;
   __s32 cpu;
 
   // prioritize kthreads. dispatch them immediately to the local DSQ
@@ -1081,10 +1138,16 @@ BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
   if ((p->nr_cpus_allowed == 1) || p->migration_disabled) {
     cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
     if (cpu >= 0) {
-      scx_bpf_dispatch(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, enq_flags);
+      scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
       __sync_fetch_and_add(&nr_direct_dispatches, 1);
       return;
     }
+  }
+
+  if ((p->nr_cpus_allowed < nr_online_cpus) || p->migration_disabled) {
+    cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+    if (cpu >= 0)
+      scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
   }
 
   tctx = try_lookup_task_ctx(p);
@@ -1095,19 +1158,11 @@ BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
   if (!primary)
     primary = p->cpus_ptr;
 
-  l2_domain = cast_mask(tctx->l2_cpumask);
-  if (!l2_domain)
-    l2_domain = p->cpus_ptr;
-
-  llc_domain = cast_mask(tctx->llc_cpumask);
-  if (!llc_domain)
-    llc_domain = p->cpus_ptr;
-
   // Prioritize handle I/O task. dispatch them immediately to the local DSQ.
-  if (tctx->io_freq > IO_FREQ_THRESHOLD) {
+  if (tctx->is_io_task) {
     p->scx.slice = CLAMP(slice_max / 4, SLICE_MIN, slice_max / 2);
     cpu = scx_bpf_pick_idle_cpu(primary, 0);
-    scx_bpf_dispatch(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, enq_flags | SCX_ENQ_PREEMPT);
+    scx_bpf_dispatch(p, SCX_DSQ_LOCAL_ON, SCX_SLICE_DFL, enq_flags | SCX_ENQ_PREEMPT);
     return;
   }
 
@@ -1115,23 +1170,6 @@ BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
   if (tctx->is_interactive) {
     scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags | SCX_ENQ_PREEMPT);
     return;
-  }
-
-  // dispatch the task considering L2/LLC cache locality
-  if (bpf_cpumask_weight(l2_domain) > 0) {
-    cpu = scx_bpf_pick_idle_cpu(l2_domain, SCX_PICK_IDLE_CORE);
-    if (cpu >= 0) {
-      scx_bpf_dispatch(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, enq_flags);
-      return;
-    }
-  }
-
-  if (bpf_cpumask_weight(llc_domain) > 0) {
-    cpu = scx_bpf_pick_idle_cpu(llc_domain, SCX_PICK_IDLE_CORE);
-    if (cpu >= 0) {
-      scx_bpf_dispatch(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, enq_flags);
-      return;
-    }
   }
 
   // Insert the task into the shared DSQ using its virtual runtime (vtime)
@@ -1166,8 +1204,8 @@ BPF_STRUCT_OPS(hoge_stopping, struct task_struct *p, bool runnable)
   struct task_ctx *tctx;
 
   cctx = try_lookup_cpu_ctx(scx_bpf_task_cpu(p));
-  if (!cctx)
-    return;
+  if (cctx)
+    cctx->tot_runtime += now - cctx->last_running;
 
   __sync_fetch_and_sub(&nr_running, 1);
 
