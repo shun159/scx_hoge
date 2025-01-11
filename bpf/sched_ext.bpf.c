@@ -380,7 +380,6 @@ scale_up_fair(const struct task_struct *p, const struct task_ctx *tctx, __u64 va
    * context switches to determine the dynamic weight.
    */
   u64 prio = p->scx.weight * CLAMP(tctx->avg_nvcsw, 1, nvcsw_max_thresh ?: 1);
-
   return CLAMP(prio, 1, MAX_TASK_WEIGHT);
 }
 
@@ -572,8 +571,9 @@ task_refill_slice(struct task_struct *p)
      * - Allow longer slices to reduce preemption and context switches.
      * - Ensure the slice is not excessively large.
      */
-    raw_slice = MIN(scale_up_fair(p, tctx, base_slice) * 2, slice_max); // Prevent over-allocation
-    slice = calc_avg_clamp(ewma_slice, raw_slice, base_slice, slice_max);
+    raw_slice =
+        MIN(scale_up_fair(p, tctx, base_slice) * 2, slice_max / 2); // Prevent over-allocation
+    slice = calc_avg_clamp(ewma_slice, raw_slice, SLICE_MIN, slice_max);
   } else {
     slice = scale_up_fair(p, tctx, base_slice);
   }
@@ -727,43 +727,6 @@ find_least_loaded_cpu(const struct cpumask *mask)
   }
 
   return candidate_cpu >= 0 ? candidate_cpu : -ENOENT;
-}
-
-// Find the least loaded CPU within the specified mask using P4C.
-// Returns the CPU with the smallest queue length, or an error code if none found.
-static __s32
-find_best_cpu_p4c(const struct cpumask *mask)
-{
-  __s32 candidates[4] = {-1, -1, -1, -1};
-  __u64 queue_lengths[4] = {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff};
-  __s32 best_candidate = -1;
-  __u64 min_queue_len = 0xffffffff;
-  int i;
-
-  if (!mask) {
-    scx_bpf_error("find_best_cpu_p4c: invalid cpumask");
-    return -EINVAL;
-  }
-
-  // Select four random CPUs within the mask
-  bpf_for(i, 0, 4)
-  {
-    candidates[i] = bpf_cpumask_any_and_distribute(mask, mask);
-    if (candidates[i] >= 0) {
-      queue_lengths[i] = scx_bpf_dsq_nr_queued(cpu_to_dsq(candidates[i]));
-    }
-  }
-
-  // Find the candidate with the smallest queue length
-  bpf_for(i, 0, 4)
-  {
-    if (candidates[i] >= 0 && queue_lengths[i] < min_queue_len) {
-      min_queue_len = queue_lengths[i];
-      best_candidate = candidates[i];
-    }
-  }
-
-  return (best_candidate >= 0) ? best_candidate : -ENOENT;
 }
 
 // Find an idle or least-loaded CPU for a task.
