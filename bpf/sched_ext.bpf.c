@@ -497,9 +497,18 @@ task_deadline(struct task_struct *p, struct task_ctx *tctx)
   if (tctx->is_interactive)
     lat_prio += CLAMP(waker_freq / 2, 1, 10);
 
-  // I/O-bound tasks get a lower (shorter) deadline.
-  if (tctx->is_io_task)
+  // Adjust for I/O-bound tasks: shorter deadlines
+  if (tctx->is_io_task) {
     lat_prio = MIN(lat_prio + 5, max_sched_prio() - 1);
+  }
+
+  /*
+   * Special adjustment for CPU-bound tasks
+   * - Long runtime and low blocked frequency warrant longer deadlines
+   */
+  if (is_cpu_bound_task(tctx) && tctx->is_interactive) {
+    lat_prio = MAX(lat_prio / 2, 1); // Lower latency priority
+  }
 
   /*
    * Translate latency priority to a scheduling weight.
@@ -510,7 +519,9 @@ task_deadline(struct task_struct *p, struct task_ctx *tctx)
    * Calculate the final deadline based on weighted average runtime.
    */
   if (tctx->is_io_task) {
-    return tctx->avg_runtime * 50 / lat_weight;
+    return tctx->avg_runtime * 40 / lat_weight;
+  } else if (is_cpu_bound_task(tctx) && tctx->is_interactive) {
+    return tctx->avg_runtime * 120 / lat_weight; // Longer deadline for CPU-bound tasks
   } else {
     return tctx->avg_runtime * 100 / lat_weight;
   }
@@ -554,7 +565,7 @@ task_refill_slice(struct task_struct *p)
   base_slice = slice_max / waiting_tasks;
   if (tctx->is_io_task) {
     slice = scale_up_fair(p, tctx, base_slice / 2);
-  } else if (is_cpu_bound_task(tctx)) {
+  } else if (is_cpu_bound_task(tctx) && tctx->is_interactive) {
     /*
      * For CPU-bound tasks:
      * - Use EWMA for smooth adaptation of slice length.
@@ -1228,7 +1239,7 @@ BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
     cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
     if (cpu >= 0 && bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
       p->scx.slice = CLAMP(slice_max / 4, SLICE_MIN, slice_max / 2);
-      scx_bpf_dispatch(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, enq_flags | SCX_ENQ_PREEMPT);
+      scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags | SCX_ENQ_PREEMPT);
       return;
     }
   }
