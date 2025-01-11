@@ -315,6 +315,21 @@ is_io_task_ready(struct task_ctx *tctx)
   return (tctx->is_io_task && (now >= tctx->io_completion_time));
 }
 
+static bool
+is_cpu_bound_task(struct task_ctx *tctx)
+{
+  const __u64 cpu_bound_threshold = 5 * NSEC_PER_MSEC;
+  const __u64 min_execution_ratio = 75;
+  const __u64 max_blocked_freq = 10;
+
+  bool high_execution_ratio = (tctx->avg_runtime > 0) &&
+                              ((tctx->sum_runtime * 100 / tctx->avg_runtime) > min_execution_ratio);
+  bool low_blocked_freq = (tctx->blocked_freq < max_blocked_freq);
+  bool long_runtime = (tctx->avg_runtime >= cpu_bound_threshold);
+
+  return high_execution_ratio && low_blocked_freq && long_runtime;
+}
+
 /*MAX_AVG_NVCSW
  * Compare two vruntime values, returns true if the first value is less than
  * the second one.
@@ -524,14 +539,27 @@ static __always_inline void
 task_refill_slice(struct task_struct *p)
 {
   struct task_ctx *tctx;
+  __u64 slice, waiting_tasks, base_slice;
 
   tctx = try_lookup_task_ctx(p);
   if (!tctx) {
-    p->scx.slice = CLAMP(slice_max / nr_tasks_waiting(), slice_max / 2, slice_max);
     return;
   }
-  if (tctx->is_io_task)
-    p->scx.slice = CLAMP(slice_max / 2, SLICE_MIN, slice_max);
+
+  waiting_tasks = nr_tasks_waiting();
+  if (waiting_tasks == 0)
+    waiting_tasks = 1;
+
+  base_slice = slice_max / waiting_tasks;
+  if (tctx->is_io_task) {
+    slice = scale_up_fair(p, tctx, base_slice / 2);
+  } else if (is_cpu_bound_task(tctx)) {
+    slice = scale_up_fair(p, tctx, base_slice) * 2;
+  } else {
+    slice = scale_up_fair(p, tctx, base_slice);
+  }
+
+  p->scx.slice = CLAMP(slice, SLICE_MIN, slice_max);
 }
 
 static __always_inline int
@@ -613,16 +641,16 @@ task_set_domain(struct task_struct *p, __s32 cpu, const struct cpumask *cpumask)
   bpf_cpumask_and(tctx->l2_cpumask, cpumask, l2_domain);
 
   /*
-   * Further narrow down the task's CPU mask to CPUs within the same LLC (Last Level Cache) domain.
-   * This ensures the task remains within a broader cache-sharing scope
-   * while still respecting the L2 domain constraints.
+   * Further narrow down the task's CPU mask to CPUs within the same LLC (Last Level Cache)
+   * domain. This ensures the task remains within a broader cache-sharing scope while still
+   * respecting the L2 domain constraints.
    */
   bpf_cpumask_and(tctx->llc_cpumask, cast_mask(l2_mask), llc_domain);
 
   /*
    * Finalize the task's CPU mask by intersecting the LLC domain mask with the original task's CPU
-   * mask. This guarantees the task's CPU affinity adheres to both LLC locality and the original CPU
-   * constraints.
+   * mask. This guarantees the task's CPU affinity adheres to both LLC locality and the original
+   * CPU constraints.
    */
   bpf_cpumask_and(tctx->cpumask, cast_mask(llc_mask), cpumask);
 }
@@ -682,11 +710,49 @@ find_least_loaded_cpu(const struct cpumask *mask)
   return candidate_cpu >= 0 ? candidate_cpu : -ENOENT;
 }
 
+// Find the least loaded CPU within the specified mask using P4C.
+// Returns the CPU with the smallest queue length, or an error code if none found.
+static __s32
+find_best_cpu_p4c(const struct cpumask *mask)
+{
+  __s32 candidates[4] = {-1, -1, -1, -1};
+  __u64 queue_lengths[4] = {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff};
+  __s32 best_candidate = -1;
+  __u64 min_queue_len = 0xffffffff;
+  int i;
+
+  if (!mask) {
+    scx_bpf_error("find_best_cpu_p4c: invalid cpumask");
+    return -EINVAL;
+  }
+
+  // Select four random CPUs within the mask
+  bpf_for(i, 0, 4)
+  {
+    candidates[i] = bpf_cpumask_any_and_distribute(mask, mask);
+    if (candidates[i] >= 0) {
+      queue_lengths[i] = scx_bpf_dsq_nr_queued(cpu_to_dsq(candidates[i]));
+    }
+  }
+
+  // Find the candidate with the smallest queue length
+  bpf_for(i, 0, 4)
+  {
+    if (candidates[i] >= 0 && queue_lengths[i] < min_queue_len) {
+      min_queue_len = queue_lengths[i];
+      best_candidate = candidates[i];
+    }
+  }
+
+  return (best_candidate >= 0) ? best_candidate : -ENOENT;
+}
+
 // Find an idle or least-loaded CPU for a task.
 // This function selects the optimal CPU based on task type and system state.
 static __s32
 pick_idle_cpu(struct task_struct *p, __s32 prev_cpu, __u64 wake_flags, bool *is_idle)
 {
+
   const struct cpumask *idle_smtmask, *idle_cpumask;
   const struct cpumask *p_mask, *l2_mask, *l3_mask;
   struct task_ctx *tctx;
@@ -718,6 +784,7 @@ pick_idle_cpu(struct task_struct *p, __s32 prev_cpu, __u64 wake_flags, bool *is_
     goto out_put_cpumask;
   }
 
+  // Step 1: WAKE_SYNC - Prioritize CPU used by the waker task.
   if (is_wake_sync(p, current, bpf_get_smp_processor_id(), prev_cpu, wake_flags)) {
     if (bpf_cpumask_test_cpu(prev_cpu, l3_mask) && scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
       cpu = prev_cpu;
@@ -726,34 +793,34 @@ pick_idle_cpu(struct task_struct *p, __s32 prev_cpu, __u64 wake_flags, bool *is_
     }
   }
 
-  // least loaded CPU, even if it's not idle
-  if (tctx->is_io_task) {
-    cpu = find_least_loaded_cpu(l3_mask);
-    if (cpu >= 0) {
-      *is_idle = false;
-      goto out_put_cpumask;
-    }
-  }
-
-  // Prioritize idle CPUs in L2 cache domain.
+  // Step 2: Prioritize idle CPUs in L2 cache domain.
   cpu = scx_bpf_pick_idle_cpu(l2_mask, 0);
   if (cpu >= 0) {
     *is_idle = true;
     goto out_put_cpumask;
   }
 
-  // Prioritize idle CPUs in L3 cache domain.
+  // Step 3: Prioritize idle CPUs in L3 cache domain.
   cpu = scx_bpf_pick_idle_cpu(l3_mask, 0);
   if (cpu >= 0) {
     *is_idle = true;
     goto out_put_cpumask;
   }
 
-  // Prioritize idle CPUs in SMT
+  // Step 4: Prioritize idle CPUs in SMT.
   if (idle_smtmask && bpf_cpumask_weight(idle_smtmask) > 0) {
     cpu = scx_bpf_pick_idle_cpu(idle_smtmask, SCX_PICK_IDLE_CORE);
     if (cpu >= 0) {
       *is_idle = true;
+      goto out_put_cpumask;
+    }
+  }
+
+  // Step 5: Select the least loaded CPU in L3 domain.
+  if (tctx->is_io_task) {
+    cpu = find_least_loaded_cpu(l3_mask);
+    if (cpu >= 0) {
+      *is_idle = false;
       goto out_put_cpumask;
     }
   }
@@ -1144,25 +1211,15 @@ BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
     }
   }
 
-  if ((p->nr_cpus_allowed < nr_online_cpus) || p->migration_disabled) {
-    cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
-    if (cpu >= 0)
-      scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-  }
-
   tctx = try_lookup_task_ctx(p);
   if (!tctx)
     return;
 
-  primary = cast_mask(tctx->cpumask);
-  if (!primary)
-    primary = p->cpus_ptr;
-
   // Prioritize handle I/O task. dispatch them immediately to the local DSQ.
   if (tctx->is_io_task) {
     p->scx.slice = CLAMP(slice_max / 4, SLICE_MIN, slice_max / 2);
-    cpu = scx_bpf_pick_idle_cpu(primary, 0);
-    scx_bpf_dispatch(p, SCX_DSQ_LOCAL_ON, SCX_SLICE_DFL, enq_flags | SCX_ENQ_PREEMPT);
+    cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+    scx_bpf_dispatch(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, enq_flags | SCX_ENQ_PREEMPT);
     return;
   }
 

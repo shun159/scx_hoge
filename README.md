@@ -1,3 +1,4 @@
+
 # scx_hoge
 
 An **eBPF-based scheduler** focused on optimizing **cache locality** and **I/O-bound task performance**, inspired by **scx_flash** and **scx_bpfland**.
@@ -59,18 +60,21 @@ Tasks are dispatched based on their characteristics:
 ---
 
 ### CPU Selection  
-The scheduler selects CPUs in the following order:  
-1. **L2 Cache Domain** (high priority)  
-2. **LLC Cache Domain**  
-3. **Idle SMT Threads**  
-4. **Least Loaded CPU** (if no idle CPU is found)  
+The scheduler uses a **least-loaded CPU selection algorithm**, prioritizing CPUs as follows:
+
+1. **Idle CPUs in L2 Cache Domain:** High priority for tasks in the same L2 cache domain.  
+2. **Idle CPUs in LLC Cache Domain:** Broader cache-sharing domain.  
+3. **Idle SMT Threads:** Ensures maximum resource utilization.  
+4. **Least Loaded CPU:** Selects the CPU with the shortest task queue when no idle CPU is available.  
 
 - **Synchronous Wakeups:** Prioritize the **waker's CPU** to reduce migration latency.  
 
 ---
 
 ### Task Execution  
-- **Dynamic Time Slices:** Adjusted via `task_refill_slice()` based on task load.  
+- **Dynamic Time Slices:** Adjusted via `task_refill_slice()` based on task type and load.  
+   - **I/O Tasks:** Given shorter time slices to minimize latency.  
+   - **CPU-Bound Tasks:** Allocated longer slices to reduce preemption.  
 - **Task Deadline:** Calculated using `task_deadline()` with I/O-bound tasks receiving **shorter deadlines**.  
 - **CPU Frequency Scaling:** Adjusted based on **task utilization** and **performance levels**.  
 
@@ -101,9 +105,9 @@ The scheduler selects CPUs in the following order:
 - `accept` / `poll`  
 
 These hooks allow the scheduler to:  
-- Identify **I/O-bound tasks** in real-time  
-- Estimate **I/O completion time**  
-- Adjust task priority dynamically  
+- Identify **I/O-bound tasks** in real-time.  
+- Estimate **I/O completion time**.  
+- Adjust task priority dynamically.  
 
 ---
 
