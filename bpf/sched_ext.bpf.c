@@ -539,6 +539,7 @@ static __always_inline void
 task_refill_slice(struct task_struct *p)
 {
   struct task_ctx *tctx;
+  __u64 raw_slice, ewma_slice = SLICE_MIN; // Initialize with minimum slice
   __u64 slice, waiting_tasks, base_slice;
 
   tctx = try_lookup_task_ctx(p);
@@ -554,7 +555,14 @@ task_refill_slice(struct task_struct *p)
   if (tctx->is_io_task) {
     slice = scale_up_fair(p, tctx, base_slice / 2);
   } else if (is_cpu_bound_task(tctx)) {
-    slice = scale_up_fair(p, tctx, base_slice) * 2;
+    /*
+     * For CPU-bound tasks:
+     * - Use EWMA for smooth adaptation of slice length.
+     * - Allow longer slices to reduce preemption and context switches.
+     * - Ensure the slice is not excessively large.
+     */
+    raw_slice = MIN(scale_up_fair(p, tctx, base_slice) * 2, slice_max); // Prevent over-allocation
+    slice = calc_avg_clamp(ewma_slice, raw_slice, base_slice, slice_max);
   } else {
     slice = scale_up_fair(p, tctx, base_slice);
   }
@@ -1217,16 +1225,21 @@ BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
 
   // Prioritize handle I/O task. dispatch them immediately to the local DSQ.
   if (tctx->is_io_task) {
-    p->scx.slice = CLAMP(slice_max / 4, SLICE_MIN, slice_max / 2);
     cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
-    scx_bpf_dispatch(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, enq_flags | SCX_ENQ_PREEMPT);
-    return;
+    if (cpu >= 0 && bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+      p->scx.slice = CLAMP(slice_max / 4, SLICE_MIN, slice_max / 2);
+      scx_bpf_dispatch(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, enq_flags | SCX_ENQ_PREEMPT);
+      return;
+    }
   }
 
   // dispatch interactive task immediately
   if (tctx->is_interactive) {
-    scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags | SCX_ENQ_PREEMPT);
-    return;
+    cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+    if (cpu >= 0 && bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+      scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags | SCX_ENQ_PREEMPT);
+      return;
+    }
   }
 
   // Insert the task into the shared DSQ using its virtual runtime (vtime)
