@@ -545,11 +545,19 @@ task_vtime(struct task_struct *p, struct task_ctx *tctx)
   return tctx->deadline;
 }
 
+/**
+ * Refills the time slice for a given task.
+ *
+ * This function calculates and sets the appropriate time slice for a task based on its
+ * characteristics (I/O-bound, CPU-bound, interactive) and the current system load.
+ *
+ */
 static __always_inline void
 task_refill_slice(struct task_struct *p)
 {
   struct task_ctx *tctx;
-  __u64 raw_slice, ewma_slice = SLICE_MIN; // Initialize with minimum slice
+  // Multiplier for increasing time slice for CPU-bound tasks
+  const __u64 cpu_bound_boost = 3;
   __u64 slice, waiting_tasks, base_slice;
 
   tctx = try_lookup_task_ctx(p);
@@ -557,25 +565,38 @@ task_refill_slice(struct task_struct *p)
     return;
   }
 
-  waiting_tasks = nr_tasks_waiting();
-  if (waiting_tasks == 0)
-    waiting_tasks = 1;
+  waiting_tasks = MAX(nr_tasks_waiting(), 1);
 
-  base_slice = slice_max / waiting_tasks;
+  // Set default values if not yet initialized
+  tctx->avg_runtime = MAX(tctx->avg_runtime, SLICE_MIN);
+  tctx->sum_runtime = MAX(tctx->sum_runtime, SLICE_MIN);
+  tctx->io_freq = MAX(tctx->io_freq, 1);
+
+  // Calculate the base time slice. It's the maximum slice divided by the greater of
+  // the sum of waiting and running tasks, or 10.
+  base_slice = slice_max / MAX(waiting_tasks + nr_running, 10);
+  __u64 raw_slice, ewma_slice = base_slice;
+
   if (tctx->is_io_task) {
-    slice = scale_up_fair(p, tctx, base_slice / 2);
+    /*
+     * For I/O-bound tasks, reduce the base slice proportionally to the I/O frequency (limited to
+     * 10). Higher I/O frequency results in a smaller slice.
+     * */
+    slice = scale_up_fair(p, tctx, base_slice / (1 + MIN(tctx->io_freq, 10)));
   } else if (is_cpu_bound_task(tctx) && tctx->is_interactive) {
     /*
-     * For CPU-bound tasks:
-     * - Use EWMA for smooth adaptation of slice length.
-     * - Allow longer slices to reduce preemption and context switches.
-     * - Ensure the slice is not excessively large.
-     */
-    raw_slice =
-        MIN(scale_up_fair(p, tctx, base_slice) * 2, slice_max / 2); // Prevent over-allocation
-    slice = calc_avg_clamp(ewma_slice, raw_slice, SLICE_MIN, slice_max);
+     * For CPU-bound and interactive tasks, calculate a time slice based on the EWMA of the task's
+     * total runtime. This allows for longer slices to reduce context switching, but the slice
+     * is still limited by slice_max and adjusted based on the task's priority.
+     *
+     * */
+    __u64 tot_runtime = (tctx->avg_runtime + tctx->sum_runtime);
+    raw_slice = MIN(scale_up_fair(p, tctx, base_slice) * cpu_bound_boost, slice_max / 2);
+    ewma_slice = calc_avg_clamp(tot_runtime * 8 / 10, raw_slice, base_slice, slice_max);
+    slice = CLAMP(ewma_slice, SLICE_MIN, slice_max);
   } else {
-    slice = scale_up_fair(p, tctx, base_slice);
+    // For other tasks, simply adjust the base slice based on task priority.
+    slice = CLAMP(scale_up_fair(p, tctx, base_slice), SLICE_MIN, slice_max);
   }
 
   p->scx.slice = CLAMP(slice, SLICE_MIN, slice_max);
@@ -925,234 +946,6 @@ enable_sibling_cpu(struct domain_arg *input)
   return err;
 }
 
-SEC("fentry/__x64_sys_read")
-int
-BPF_PROG(fentry_sys_read, unsigned int fd, char *buf, size_t count)
-{
-  struct task_struct *p = (void *)bpf_get_current_task_btf();
-  struct task_ctx *tctx = try_lookup_task_ctx(p);
-
-  if (!tctx)
-    return 0;
-
-  tctx->is_io_task = true;
-  tctx->io_start_time = bpf_ktime_get_ns();
-  tctx->io_completion_time = bpf_ktime_get_ns() + (SLICE_MIN / 2); // Predict shorter deadline
-
-  return 0;
-}
-
-SEC("fexit/__x64_sys_read")
-int
-BPF_PROG(fexit_sys_read, unsigned int fd, char *buf, size_t count, ssize_t ret)
-{
-  struct task_struct *p = (void *)bpf_get_current_task_btf();
-  struct task_ctx *tctx = try_lookup_task_ctx(p);
-
-  if (!tctx)
-    return 0;
-
-  u64 now = bpf_ktime_get_ns();
-  u64 io_duration = now - tctx->io_start_time;
-
-  tctx->is_io_task = false;
-  tctx->avg_io_latency = calc_avg(tctx->avg_io_latency, io_duration);
-  tctx->io_completion_time = now;
-  tctx->io_freq = update_freq(tctx->io_freq, MAX(now - tctx->last_woke_at, 1));
-
-  return 0;
-}
-
-SEC("fentry/__x64_sys_recvfrom")
-int
-BPF_PROG(fentry_sys_recvfrom, int sockfd, void *buf, size_t len, int flags)
-{
-  struct task_struct *p = (void *)bpf_get_current_task_btf();
-  struct task_ctx *tctx = try_lookup_task_ctx(p);
-
-  if (!tctx)
-    return 0;
-
-  tctx->is_io_task = true;
-  tctx->io_start_time = bpf_ktime_get_ns();
-  tctx->io_completion_time = bpf_ktime_get_ns() + (SLICE_MIN / 2); // Predict shorter deadline
-
-  return 0;
-}
-
-SEC("fentry/__x64_sys_sendto")
-int
-BPF_PROG(fentry_sys_sendto, int sockfd, const void *buf, size_t len, int flags)
-{
-  struct task_struct *p = (void *)bpf_get_current_task_btf();
-  struct task_ctx *tctx = try_lookup_task_ctx(p);
-
-  if (!tctx)
-    return 0;
-
-  tctx->is_io_task = true;
-  tctx->io_start_time = bpf_ktime_get_ns();
-  tctx->io_completion_time = bpf_ktime_get_ns() + (SLICE_MIN / 2); // Predict shorter deadline
-
-  return 0;
-}
-
-SEC("fexit/__x64_sys_recvfrom")
-int
-BPF_PROG(fexit_sys_recvfrom, int sockfd, void *buf, size_t len, int flags, ssize_t ret)
-{
-  struct task_struct *p = (void *)bpf_get_current_task_btf();
-  struct task_ctx *tctx = try_lookup_task_ctx(p);
-
-  if (!tctx)
-    return 0;
-
-  u64 now = bpf_ktime_get_ns();
-  u64 io_duration = now - tctx->io_start_time;
-
-  tctx->is_io_task = false;
-  tctx->avg_io_latency = calc_avg(tctx->avg_io_latency, io_duration);
-  tctx->io_completion_time = now;
-  tctx->io_freq = update_freq(tctx->io_freq, MAX(now - tctx->last_woke_at, 1));
-
-  return 0;
-}
-
-SEC("fexit/__x64_sys_sendto")
-int
-BPF_PROG(fexit_sys_sendto, int sockfd, const void *buf, size_t len, int flags, ssize_t ret)
-{
-  struct task_struct *p = (void *)bpf_get_current_task_btf();
-  struct task_ctx *tctx = try_lookup_task_ctx(p);
-
-  if (!tctx)
-    return 0;
-
-  u64 now = bpf_ktime_get_ns();
-  u64 io_duration = now - tctx->io_start_time;
-
-  tctx->is_io_task = false;
-  tctx->avg_io_latency = calc_avg(tctx->avg_io_latency, io_duration);
-  tctx->io_completion_time = now;
-  tctx->io_freq = update_freq(tctx->io_freq, MAX(now - tctx->last_woke_at, 1));
-
-  return 0;
-}
-
-SEC("fentry/__x64_sys_accept")
-int
-BPF_PROG(fentry_sys_accept, int sockfd, struct sockaddr *addr, void *addrlen)
-{
-  struct task_struct *p = (void *)bpf_get_current_task_btf();
-  struct task_ctx *tctx = try_lookup_task_ctx(p);
-
-  if (!tctx)
-    return 0;
-
-  tctx->is_io_task = true;
-  tctx->io_start_time = bpf_ktime_get_ns();
-  tctx->io_completion_time = bpf_ktime_get_ns() + (SLICE_MIN / 2); // Predict shorter deadline
-
-  return 0;
-}
-
-SEC("fexit/__x64_sys_accept")
-int
-BPF_PROG(fexit_sys_accept, int sockfd, struct sockaddr *addr, void *addrlen, int ret)
-{
-  struct task_struct *p = (void *)bpf_get_current_task_btf();
-  struct task_ctx *tctx = try_lookup_task_ctx(p);
-
-  if (!tctx)
-    return 0;
-
-  u64 now = bpf_ktime_get_ns();
-  u64 io_duration = now - tctx->io_start_time;
-
-  tctx->is_io_task = false;
-  tctx->avg_io_latency = calc_avg(tctx->avg_io_latency, io_duration);
-  tctx->io_completion_time = now;
-  tctx->io_freq = update_freq(tctx->io_freq, MAX(now - tctx->last_woke_at, 1));
-
-  return 0;
-}
-
-SEC("fentry/__x64_sys_poll")
-int
-BPF_PROG(fentry_sys_poll, struct pollfd *fds, __u32 nfds, int timeout)
-{
-  struct task_struct *p = (void *)bpf_get_current_task_btf();
-  struct task_ctx *tctx = try_lookup_task_ctx(p);
-
-  if (!tctx)
-    return 0;
-
-  tctx->is_io_task = true;
-  tctx->io_start_time = bpf_ktime_get_ns();
-  tctx->io_completion_time = bpf_ktime_get_ns() + (SLICE_MIN / 2); // Predict shorter deadline
-
-  return 0;
-}
-
-SEC("fexit/__x64_sys_poll")
-int
-BPF_PROG(fexit_sys_poll, struct pollfd *fds, __u32 nfds, int timeout, int ret)
-{
-  struct task_struct *p = (void *)bpf_get_current_task_btf();
-  struct task_ctx *tctx = try_lookup_task_ctx(p);
-
-  if (!tctx)
-    return 0;
-
-  u64 now = bpf_ktime_get_ns();
-  u64 io_duration = now - tctx->io_start_time;
-
-  tctx->is_io_task = false;
-  tctx->avg_io_latency = calc_avg(tctx->avg_io_latency, io_duration);
-  tctx->io_completion_time = now;
-  tctx->io_freq = update_freq(tctx->io_freq, MAX(now - tctx->last_woke_at, 1));
-
-  return 0;
-}
-
-SEC("fentry/__x64_sys_futex")
-int
-BPF_PROG(fentry_sys_futex, struct pollfd *fds, __u32 nfds, int timeout)
-{
-  struct task_struct *p = (void *)bpf_get_current_task_btf();
-  struct task_ctx *tctx = try_lookup_task_ctx(p);
-
-  if (!tctx)
-    return 0;
-
-  tctx->is_io_task = true;
-  tctx->io_start_time = bpf_ktime_get_ns();
-  tctx->io_completion_time = bpf_ktime_get_ns() + (SLICE_MIN / 2); // Predict shorter deadline
-
-  return 0;
-}
-
-SEC("fexit/__x64_sys_futex")
-int
-BPF_PROG(fexit_sys_futex, struct pollfd *fds, __u32 nfds, int timeout, int ret)
-{
-  struct task_struct *p = (void *)bpf_get_current_task_btf();
-  struct task_ctx *tctx = try_lookup_task_ctx(p);
-
-  if (!tctx)
-    return 0;
-
-  u64 now = bpf_ktime_get_ns();
-  u64 io_duration = now - tctx->io_start_time;
-
-  tctx->is_io_task = false;
-  tctx->avg_io_latency = calc_avg(tctx->avg_io_latency, io_duration);
-  tctx->io_completion_time = now;
-  tctx->io_freq = update_freq(tctx->io_freq, MAX(now - tctx->last_woke_at, 1));
-
-  return 0;
-}
-
 __s32
 BPF_STRUCT_OPS(hoge_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
@@ -1178,7 +971,7 @@ BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
 
   // prioritize kthreads. dispatch them immediately to the local DSQ
   if (is_kthread(p) && (local_kthreads || p->nr_cpus_allowed == 1)) {
-    scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags | SCX_ENQ_PREEMPT);
+    scx_bpf_dispatch(p, SCX_DSQ_LOCAL, slice_max, enq_flags | SCX_ENQ_PREEMPT);
     __sync_fetch_and_add(&nr_kthread_dispatches, 1);
     return;
   }
@@ -1187,7 +980,7 @@ BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
   if ((p->nr_cpus_allowed == 1) || p->migration_disabled) {
     cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
     if (cpu >= 0) {
-      scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
+      scx_bpf_dispatch(p, SCX_DSQ_LOCAL, slice_max, enq_flags);
       __sync_fetch_and_add(&nr_direct_dispatches, 1);
       return;
     }
@@ -1202,7 +995,7 @@ BPF_STRUCT_OPS(hoge_enqueue, struct task_struct *p, __u64 enq_flags)
     cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
     if (cpu >= 0 && bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
       p->scx.slice = CLAMP(slice_max / 4, SLICE_MIN, slice_max / 2);
-      scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags | SCX_ENQ_PREEMPT);
+      scx_bpf_dispatch(p, SCX_DSQ_LOCAL, slice_max, enq_flags | SCX_ENQ_PREEMPT);
       return;
     }
   }
@@ -1317,12 +1110,10 @@ BPF_STRUCT_OPS(hoge_quiescent, struct task_struct *p, u64 deq_flags)
   tctx->blocked_freq = update_freq(tctx->blocked_freq, delta);
   tctx->last_blocked_at = now;
 
-  if (!tctx->is_io_task) {
-    tctx->is_io_task = true; // Fallback assumption
-    tctx->io_start_time = now;
-    tctx->io_freq = update_freq(tctx->io_freq, delta);
-    tctx->io_completion_time = now + (SLICE_MIN / 2); // Predict shorter deadline
-  }
+  tctx->is_io_task = true; // Fallback assumption
+  tctx->io_start_time = now;
+  tctx->io_freq = update_freq(tctx->io_freq, delta);
+  tctx->io_completion_time = now + (SLICE_MIN / 2); // Predict shorter deadline
 }
 
 void
@@ -1348,15 +1139,13 @@ BPF_STRUCT_OPS(hoge_runnable, struct task_struct *p, __u64 enq_flags)
   tctx->waker_freq = update_freq(tctx->waker_freq, delta);
   tctx->last_woke_at = now;
 
-  if (!tctx->is_io_task) {
-    delta = MAX(now - tctx->last_woke_at, 1);
+  delta = MAX(now - tctx->last_woke_at, 1);
 
-    tctx->is_io_task = false; // Clear I/O-bound flag
-    tctx->avg_io_latency = calc_avg(tctx->avg_io_latency, delta);
-    tctx->io_completion_time = now;
-    tctx->last_io_blocked = now;
-    tctx->io_freq = update_freq(tctx->io_freq, delta);
-  }
+  tctx->is_io_task = false; // Clear I/O-bound flag
+  tctx->avg_io_latency = calc_avg(tctx->avg_io_latency, delta);
+  tctx->io_completion_time = now;
+  tctx->last_io_blocked = now;
+  tctx->io_freq = update_freq(tctx->io_freq, delta);
 }
 
 void
@@ -1407,6 +1196,9 @@ BPF_STRUCT_OPS(hoge_init_task, struct task_struct *p, struct scx_init_task_args 
   INIT_TASK_CPUMASK(tctx, cpumask, llc_cpumask);
 
   task_set_domain(p, cpu, p->cpus_ptr);
+
+  tctx->sum_runtime = 0;
+  tctx->avg_runtime = SLICE_MIN * 5;
 
   // Initialize I/O-related fields
   tctx->is_io_task = false;

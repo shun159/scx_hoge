@@ -52,47 +52,6 @@ func enableSiblingCpu(objs *bpfObjects, cacheLvl, cpuID, sibID int) error {
 	return nil
 }
 
-// attachProgram attaches an eBPF program.
-func attachProgram(prog *ebpf.Program, name string) (link.Link, error) {
-	tracingLink, err := link.AttachTracing(link.TracingOptions{
-		Program: prog,
-	})
-	if err != nil {
-		return nil, errors.Wrapf(err, "Failed to attach program %s", name)
-	}
-	log.Infof("Successfully attached program: %s", name)
-	return tracingLink, nil
-}
-
-// attachPrograms attaches multiple eBPF programs.
-func attachPrograms(objs *bpfObjects) []link.Link {
-	programs := map[string]*ebpf.Program{
-		"FentrySysRead":     objs.FentrySysRead,
-		"FexitSysRead":      objs.FexitSysRead,
-		"FentrySysAccept":   objs.FentrySysAccept,
-		"FexitSysAccept":    objs.FexitSysAccept,
-		"FentrySysPoll":     objs.FentrySysPoll,
-		"FexitSysPoll":      objs.FexitSysPoll,
-		"FentrySysRecvfrom": objs.FentrySysRecvfrom,
-		"FexitSysRecvfrom":  objs.FexitSysRecvfrom,
-		"FentrySysSendto":   objs.FentrySysSendto,
-		"FexitSysSendto":    objs.FexitSysSendto,
-		"FentrySysFutex":    objs.FentrySysFutex,
-		"FexitSysFutex":     objs.FexitSysFutex,
-	}
-
-	var links []link.Link
-	for name, prog := range programs {
-		l, err := attachProgram(prog, name)
-		if err != nil {
-			log.Fatalf("Program attachment failed: %s", err)
-		}
-		links = append(links, l)
-	}
-
-	return links
-}
-
 // configureCPUTopology configures CPU sibling relationships.
 func configureCPUTopology(objs *bpfObjects) {
 	topology, err := scx_utils.NewTopology()
@@ -148,16 +107,6 @@ func main() {
 		log.Fatalf("Failed to load BPF objects: %v", err)
 	}
 	defer objs.Close()
-
-	// Attach programs
-	links := attachPrograms(&objs)
-	defer func() {
-		for _, l := range links {
-			if l != nil {
-				l.Close()
-			}
-		}
-	}()
 
 	// Configure CPU topology
 	configureCPUTopology(&objs)
